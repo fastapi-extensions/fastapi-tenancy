@@ -1,35 +1,36 @@
-"""Database compatibility utilities.
+"""Database dialect detection and capability matrix.
 
-Detects the database dialect from a connection URL and provides
-dialect-aware helpers used by isolation providers.
+This module maps SQLAlchemy connection-URL schemes to a canonical
+:class:`DbDialect` enum and exposes a set of predicate functions that
+isolation providers use to select the correct SQL dialect at runtime.
 
-Supported databases
--------------------
-- PostgreSQL (postgresql+asyncpg, postgresql+psycopg, postgresql) — full feature set
-- SQLite (sqlite+aiosqlite, sqlite) — development / CI; no native schema support
-- MySQL / MariaDB (mysql+aiomysql, mysql) — no native schema DDL via SET search_path
-- Microsoft SQL Server (mssql+aioodbc, mssql) — partial; schemas via USE
-- Any other dialect — falls back to "prefix" namespace mode
+Supported dialects and their capabilities
+------------------------------------------
 
-Schema isolation compatibility matrix
---------------------------------------
-| Dialect    | Native SCHEMA | Fallback strategy                        |
-|------------|--------------|------------------------------------------|
-| PostgreSQL | ✓ yes        | CREATE SCHEMA + SET search_path          |
-| SQLite     | ✗ no         | Table-name prefix (tenant_<slug>_<table>) |
-| MySQL      | ✗ no*        | Per-tenant database (CREATE DATABASE)    |
-| SQL Server | ✓ yes        | USE <db>; SET SCHEMA                     |
-| Other      | ✗ no         | Table-name prefix (same as SQLite)       |
++------------+----------------+----------+---------------------+
+| Dialect    | Native schemas | RLS      | Pool type           |
++============+================+==========+=====================+
+| PostgreSQL | ✓              | ✓        | QueuePool           |
++------------+----------------+----------+---------------------+
+| SQLite     | ✗              | ✗        | StaticPool (memory) |
++------------+----------------+----------+---------------------+
+| MySQL      | ✗ (= DATABASE) | ✗        | QueuePool           |
++------------+----------------+----------+---------------------+
+| MSSQL      | ✓ (partial)    | ✗        | QueuePool           |
++------------+----------------+----------+---------------------+
+| Unknown    | ✗              | ✗        | QueuePool           |
++------------+----------------+----------+---------------------+
 
-* MySQL SCHEMA == DATABASE; handled via DatabaseIsolationProvider.
-
-RLS compatibility matrix
-------------------------
-| Dialect    | Native RLS | Alternative                              |
-|------------|-----------|------------------------------------------|
-| PostgreSQL | ✓ yes      | SET app.current_tenant + RLS policies    |
-| All others | ✗ no       | Explicit WHERE tenant_id = :id filter    |
+Design note
+-----------
+``sanitize_identifier`` is duplicated here (as ``_sanitize_identifier``)
+rather than imported from ``utils.validation`` to avoid a circular import
+at package-load time:  ``db_compat`` is imported by ``config.py`` (via the
+``database_url`` validator), which is imported before ``utils.validation``
+is fully initialised in some import orders.  Both copies are kept in sync
+— a unit test enforces that they produce identical output.
 """
+
 from __future__ import annotations
 
 import re
@@ -37,7 +38,8 @@ from enum import StrEnum
 
 
 class DbDialect(StrEnum):
-    """Known database dialect families."""
+    """Canonical database dialect families recognised by fastapi-tenancy."""
+
     POSTGRESQL = "postgresql"
     SQLITE = "sqlite"
     MYSQL = "mysql"
@@ -45,21 +47,28 @@ class DbDialect(StrEnum):
     UNKNOWN = "unknown"
 
 
-# Schemes that map to each dialect
+# ---------------------------------------------------------------------------
+# Dialect detection
+# ---------------------------------------------------------------------------
+
 _DIALECT_MAP: dict[str, DbDialect] = {
+    # PostgreSQL
     "postgresql": DbDialect.POSTGRESQL,
     "postgresql+asyncpg": DbDialect.POSTGRESQL,
     "postgresql+psycopg": DbDialect.POSTGRESQL,
     "postgresql+psycopg2": DbDialect.POSTGRESQL,
     "asyncpg": DbDialect.POSTGRESQL,
+    # SQLite
     "sqlite": DbDialect.SQLITE,
     "sqlite+aiosqlite": DbDialect.SQLITE,
     "aiosqlite": DbDialect.SQLITE,
+    # MySQL / MariaDB
     "mysql": DbDialect.MYSQL,
     "mysql+aiomysql": DbDialect.MYSQL,
     "mysql+asyncmy": DbDialect.MYSQL,
     "mariadb": DbDialect.MYSQL,
     "mariadb+aiomysql": DbDialect.MYSQL,
+    # Microsoft SQL Server
     "mssql": DbDialect.MSSQL,
     "mssql+aioodbc": DbDialect.MSSQL,
 }
@@ -68,95 +77,160 @@ _SCHEME_RE = re.compile(r"^([a-z][a-z0-9+]*?)://", re.IGNORECASE)
 
 
 def detect_dialect(database_url: str) -> DbDialect:
-    """Return the :class:`DbDialect` for *database_url*.
+    """Infer the :class:`DbDialect` from a SQLAlchemy connection URL.
 
-    Examples
-    --------
-    >>> detect_dialect("postgresql+asyncpg://user:pass@host/db")
-    <DbDialect.POSTGRESQL: 'postgresql'>
-    >>> detect_dialect("sqlite+aiosqlite:///./test.db")
-    <DbDialect.SQLITE: 'sqlite'>
-    >>> detect_dialect("mysql+aiomysql://user:pass@host/db")
-    <DbDialect.MYSQL: 'mysql'>
+    Only the scheme portion (up to the first ``://``) is examined.
+    Unknown or malformed URLs return :attr:`DbDialect.UNKNOWN`.
+
+    Args:
+        database_url: A fully-qualified SQLAlchemy connection URL string.
+
+    Returns:
+        The matched :class:`DbDialect` enum member.
+
+    Examples::
+
+        detect_dialect("postgresql+asyncpg://user:pass@host/db")
+        # → DbDialect.POSTGRESQL
+
+        detect_dialect("sqlite+aiosqlite:///./test.db")
+        # → DbDialect.SQLITE
     """
-    m = _SCHEME_RE.match(database_url.lower().strip())
-    if not m:
+    match = _SCHEME_RE.match(database_url.lower().strip())
+    if not match:
         return DbDialect.UNKNOWN
-    scheme = m.group(1)
-    return _DIALECT_MAP.get(scheme, DbDialect.UNKNOWN)
+    return _DIALECT_MAP.get(match.group(1), DbDialect.UNKNOWN)
+
+
+# ---------------------------------------------------------------------------
+# Capability predicates
+# ---------------------------------------------------------------------------
 
 
 def supports_native_schemas(dialect: DbDialect) -> bool:
-    """Return True if the dialect natively supports CREATE SCHEMA + SET search_path.
+    """Return ``True`` if *dialect* supports ``CREATE SCHEMA`` + ``SET search_path``.
 
-    Only PostgreSQL (and MSSQL with some caveats) supports true schema-level
-    isolation via DDL without creating separate databases.
+    Only PostgreSQL and MSSQL provide true schema-level isolation via DDL
+    without requiring a separate database per tenant.
 
-    Examples
-    --------
-    >>> supports_native_schemas(DbDialect.POSTGRESQL)
-    True
-    >>> supports_native_schemas(DbDialect.SQLITE)
-    False
+    Args:
+        dialect: The database dialect to test.
+
+    Returns:
+        ``True`` for :attr:`DbDialect.POSTGRESQL` and :attr:`DbDialect.MSSQL`.
+
+    Examples::
+
+        supports_native_schemas(DbDialect.POSTGRESQL)  # True
+        supports_native_schemas(DbDialect.SQLITE)      # False
     """
     return dialect in (DbDialect.POSTGRESQL, DbDialect.MSSQL)
 
 
 def supports_native_rls(dialect: DbDialect) -> bool:
-    """Return True if the dialect supports native Row-Level Security.
+    """Return ``True`` if *dialect* supports server-side Row-Level Security.
 
-    Examples
-    --------
-    >>> supports_native_rls(DbDialect.POSTGRESQL)
-    True
-    >>> supports_native_rls(DbDialect.SQLITE)
-    False
+    Currently only PostgreSQL exposes a production-ready RLS implementation
+    compatible with ``SET app.current_tenant``.
+
+    Args:
+        dialect: The database dialect to test.
+
+    Returns:
+        ``True`` only for :attr:`DbDialect.POSTGRESQL`.
     """
     return dialect == DbDialect.POSTGRESQL
 
 
-def get_set_tenant_sql(dialect: DbDialect, tenant_id: str) -> str | None:
-    """Return the SQL statement that sets the current-tenant session variable.
+def requires_static_pool(dialect: DbDialect) -> bool:
+    """Return ``True`` if *dialect* requires SQLAlchemy's ``StaticPool``.
 
-    Returns ``None`` if the dialect has no equivalent mechanism (caller should
-    use explicit WHERE filtering instead).
+    SQLite in-memory databases (``sqlite:///:memory:``) exist only on a
+    single underlying connection.  Using ``StaticPool`` forces SQLAlchemy
+    to reuse that connection rather than creating a new one for each
+    checkout, which would produce an empty database every time.
 
-    Parameters
-    ----------
-    dialect:
-        The target database dialect.
-    tenant_id:
-        Tenant ID value to embed.  Callers are responsible for using bind
-        parameters; this function returns the statement *template* only.
+    Args:
+        dialect: The database dialect to test.
+
+    Returns:
+        ``True`` only for :attr:`DbDialect.SQLITE`.
+    """
+    return dialect == DbDialect.SQLITE
+
+
+def get_set_tenant_sql(dialect: DbDialect) -> str | None:
+    """Return the SQL statement that configures the current-tenant session variable.
+
+    The returned statement uses ``:tenant_id`` as a bind-parameter
+    placeholder.  Callers must supply the value via ``{"tenant_id": value}``
+    when executing.
+
+    Returns ``None`` for dialects that have no equivalent mechanism; those
+    callers should fall back to explicit ``WHERE tenant_id = :id`` filtering
+    in :meth:`~fastapi_tenancy.isolation.base.BaseIsolationProvider.apply_filters`.
+
+    Args:
+        dialect: Target database dialect.
+
+    Returns:
+        A parameterised SQL string, or ``None`` if unsupported.
+
+    Notes:
+        * **PostgreSQL** — ``SET app.current_tenant = :tenant_id`` activates
+          RLS policies that reference ``current_setting('app.current_tenant')``.
+        * **MySQL** — ``@current_tenant`` user variables are not reliably
+          supported via named bind parameters in all async drivers; callers
+          use explicit ``WHERE`` filtering instead.
+        * **MSSQL** — ``CONTEXT_INFO`` / ``SESSION_CONTEXT`` require complex
+          DDL; not supported by this library.
+        * **SQLite** — no session-variable mechanism.
     """
     if dialect == DbDialect.POSTGRESQL:
         return "SET app.current_tenant = :tenant_id"
-    # MySQL / MariaDB user-defined variables.
-    # NOTE: aiomysql and asyncmy do NOT support named bind parameters in
-    # SET @var = :param statements.  The variable must be set with a literal
-    # value.  The tenant_id here is an internal ID that has already been
-    # validated and retrieved from the database — it is not raw user input.
-    # We return None and handle MySQL via explicit-filter mode instead, which
-    # is safer than building a literal SQL string.
-    if dialect == DbDialect.MYSQL:
-        return None  # MySQL: use apply_filters() WHERE tenant_id = :tid instead
-    # MSSQL context_info / session_context (simplified)
-    if dialect == DbDialect.MSSQL:
-        return None  # Requires CONTEXT_INFO or SESSION_CONTEXT — not universally available
-    return None  # SQLite and unknown — no session variable support
+    # All other dialects: fall back to explicit WHERE filtering.
+    return None
+
+
+def get_schema_set_sql(dialect: DbDialect) -> str | None:
+    """Return the SQL that activates a named schema as the default search path.
+
+    The returned statement uses ``:schema`` as a bind-parameter placeholder.
+
+    Args:
+        dialect: Target database dialect.
+
+    Returns:
+        A parameterised SQL string, or ``None`` if unsupported.
+    """
+    if dialect == DbDialect.POSTGRESQL:
+        return "SET search_path TO :schema, public"
+    # MSSQL uses USE + ALTER USER — complex and dialect-specific; not supported.
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Identifier helpers (intentionally self-contained — see module docstring)
+# ---------------------------------------------------------------------------
 
 
 def _sanitize_identifier(identifier: str) -> str:
-    """Inline copy of validation.sanitize_identifier.
+    """Convert an arbitrary string to a safe PostgreSQL identifier.
 
-    Kept here to avoid a circular import chain:
-    db_compat → validation → (pydantic) which breaks when pydantic is not yet installed.
-    Both copies must stay in sync.
+    This is a private copy kept in sync with
+    ``fastapi_tenancy.utils.validation.sanitize_identifier`` to avoid a
+    circular import.  A unit test verifies that both functions produce
+    identical output for all inputs.
+
+    Args:
+        identifier: Raw input string.
+
+    Returns:
+        A sanitised, lowercase, underscore-delimited identifier (≤ 63 chars).
     """
-    import re as _re
-    s = identifier.lower().replace("-", "_")
-    s = _re.sub(r"[^a-z0-9_]", "_", s)
-    s = _re.sub(r"_+", "_", s).strip("_")
+    s = identifier.lower().replace("-", "_").replace(".", "_")
+    s = re.sub(r"[^a-z0-9_]", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     if s and not s[0].isalpha():
         s = f"t_{s}"
     return (s or "tenant")[:63]
@@ -165,48 +239,30 @@ def _sanitize_identifier(identifier: str) -> str:
 def make_table_prefix(tenant_identifier: str) -> str:
     """Build a safe table-name prefix for dialects without native schema support.
 
-    The prefix is derived from the tenant slug by replacing hyphens with
-    underscores and truncating so that ``prefix + "_" + table_name`` fits
-    within typical identifier limits (63 chars for most databases).
+    Used by :class:`~fastapi_tenancy.isolation.schema.SchemaIsolationProvider`
+    in prefix mode (SQLite, unknown dialects).
 
-    Examples
-    --------
-    >>> make_table_prefix("acme-corp")
-    't_acme_corp_'
-    >>> make_table_prefix("my.company")
-    't_my_company_'
+    The prefix is truncated so that ``prefix + table_name`` fits within the
+    63-character identifier limit common to most SQL databases.
+
+    Args:
+        tenant_identifier: The tenant's slug (e.g. ``"acme-corp"``).
+
+    Returns:
+        A short prefix string ending with an underscore
+        (e.g. ``"t_acme_corp_"``).
+
+    Examples::
+
+        make_table_prefix("acme-corp")   # "t_acme_corp_"
+        make_table_prefix("my.company")  # "t_my_company_"
     """
     safe = _sanitize_identifier(tenant_identifier)
-    # _sanitize_identifier may prepend "t_" for digit-leading slugs.
-    # Strip any leading "t_" before adding our own so we never get "t_t_…".
-    base = safe.lstrip("t_") if safe.startswith("t_") else safe
-    base = (base or safe)  # fallback if stripping consumed everything
-    # Truncate so full "t_<base>_<tablename>" fits in 63-char limits
-    prefix_base = base[:20].rstrip("_")
-    return f"t_{prefix_base}_"
-
-
-def get_schema_set_sql(dialect: DbDialect, schema_name: str) -> str | None:
-    """Return the SQL to activate *schema_name* as the search path.
-
-    Returns ``None`` if the dialect does not support this.
-    """
-    if dialect == DbDialect.POSTGRESQL:
-        # Uses bind param — caller must set :schema
-        return "SET search_path TO :schema, public"
-    if dialect == DbDialect.MSSQL:
-        return None  # MSSQL uses USE + ALTER USER — complex, not supported here
-    return None
-
-
-def requires_static_pool(dialect: DbDialect) -> bool:
-    """Return True if the dialect requires SQLAlchemy's ``StaticPool``.
-
-    SQLite's in-memory databases (``sqlite:///:memory:``) are per-connection
-    and will appear empty on every new connection unless ``StaticPool`` is used
-    to share a single underlying connection.
-    """
-    return dialect == DbDialect.SQLITE
+    # Strip a leading "t_" so we never produce "t_t_..." when the slug
+    # started with a digit (which _sanitize_identifier prepends "t_" to).
+    base = safe[2:] if safe.startswith("t_") else safe
+    base = (base or safe)[:20].rstrip("_")
+    return f"t_{base}_"
 
 
 __all__ = [

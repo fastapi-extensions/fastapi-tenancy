@@ -1,7 +1,22 @@
-"""Abstract tenant storage interface and repository pattern implementation.
+"""Abstract tenant storage interface — the repository pattern.
 
-This module defines the repository interface for tenant storage with support
-for multiple backend implementations (PostgreSQL, Redis, In-Memory).
+:class:`TenantStore` defines the complete CRUD contract for tenant metadata
+storage.  All concrete implementations (SQLAlchemy, in-memory, Redis cache)
+implement this interface, giving the rest of the library a stable dependency
+target regardless of the chosen backend.
+
+Extending
+---------
+To add a custom backend, subclass :class:`TenantStore` and implement every
+``@abstractmethod``.  Optional overrides (``get_by_ids``, ``search``,
+``bulk_update_status``) have base implementations but are worth overriding
+for production backends to avoid loading all tenants into memory::
+
+    class MyStore(TenantStore):
+        async def get_by_id(self, tenant_id: str) -> Tenant:
+            ...
+        # implement all other abstract methods
+        ...
 """
 
 from __future__ import annotations
@@ -18,171 +33,107 @@ if TYPE_CHECKING:
 
 
 class TenantStore(ABC):
-    """Abstract base class for tenant storage implementations.
+    """Abstract base class for tenant metadata storage backends.
 
-    This defines the repository interface that all tenant storage implementations
-    must follow. It provides a consistent API for tenant CRUD operations regardless
-    of the underlying storage backend.
+    Implementations must be fully async and safe for concurrent use across
+    multiple asyncio tasks.  Methods must raise
+    :class:`~fastapi_tenancy.core.exceptions.TenantNotFoundError` (never
+    return ``None``) when a required tenant cannot be found, and wrap
+    unexpected storage errors in
+    :class:`~fastapi_tenancy.core.exceptions.TenancyError`.
 
-    The repository pattern provides:
-    - Abstraction over data access
-    - Easy testing with mock repositories
-    - Ability to swap storage backends
-    - Clean separation of concerns
-
-    Implementations:
-    - PostgreSQLTenantStore: Production persistent storage
-    - RedisTenantStore: High-performance caching
-    - InMemoryTenantStore: Testing and development
-
-    Example:
-        ```python
-        # Using PostgreSQL
-        store = PostgreSQLTenantStore(database_url="postgresql://...")
-        await store.initialize()
-
-        # Create tenant
-        tenant = Tenant(id="123", identifier="acme", name="Acme Corp")
-        await store.create(tenant)
-
-        # Retrieve tenant
-        tenant = await store.get_by_id("123")
-
-        # Update tenant
-        updated = tenant.model_copy(update={"name": "Acme Corporation"})
-        await store.update(updated)
-
-        # List tenants
-        tenants = await store.list(skip=0, limit=10)
-
-        # Delete tenant
-        await store.delete("123")
-        ```
+    Thread-safety contract
+    ----------------------
+    * Instances are created once during application startup and shared across
+      all requests.  Implementations must be thread-safe and reentrant.
+    * No instance state may be mutated after initialisation (beyond internal
+      connection-pool bookkeeping managed by the database driver).
     """
+
+    # ------------------------------------------------------------------
+    # Required CRUD operations
+    # ------------------------------------------------------------------
 
     @abstractmethod
     async def get_by_id(self, tenant_id: str) -> Tenant:
-        """Get tenant by unique ID.
+        """Fetch a tenant by its opaque unique ID.
 
         Args:
-            tenant_id: Unique tenant identifier
+            tenant_id: Opaque tenant primary key.
 
         Returns:
-            Tenant object
+            The matching :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-
-        Example:
-            ```python
-            tenant = await store.get_by_id("tenant-123")
-            print(f"Found: {tenant.name}")
-            ```
+            TenantNotFoundError: When no tenant with *tenant_id* exists.
         """
-        pass
 
     @abstractmethod
     async def get_by_identifier(self, identifier: str) -> Tenant:
-        """Get tenant by human-readable identifier (slug).
+        """Fetch a tenant by its human-readable slug identifier.
 
         Args:
-            identifier: Tenant identifier/slug (e.g., 'acme-corp')
+            identifier: The tenant slug (e.g. ``"acme-corp"``).
 
         Returns:
-            Tenant object
+            The matching :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-
-        Example:
-            ```python
-            tenant = await store.get_by_identifier("acme-corp")
-            print(f"Tenant ID: {tenant.id}")
-            ```
+            TenantNotFoundError: When no tenant with *identifier* exists.
         """
-        pass
 
     @abstractmethod
     async def create(self, tenant: Tenant) -> Tenant:
-        """Create a new tenant.
+        """Persist a new tenant record.
 
         Args:
-            tenant: Tenant object to create
+            tenant: A fully-populated :class:`~fastapi_tenancy.core.types.Tenant`.
+                The ``id`` and ``identifier`` must be unique.
 
         Returns:
-            Created tenant with any generated fields populated
+            The stored tenant (may include server-generated timestamps).
 
         Raises:
-            ValueError: If tenant with same ID or identifier already exists
-            TenancyError: If creation fails
-
-        Example:
-            ```python
-            tenant = Tenant(
-                id="new-123",
-                identifier="new-corp",
-                name="New Corporation",
-                status=TenantStatus.PROVISIONING
-            )
-            created = await store.create(tenant)
-            ```
+            ValueError: When the ``id`` or ``identifier`` already exists.
+            TenancyError: On unexpected storage failure.
         """
-        pass
 
     @abstractmethod
     async def update(self, tenant: Tenant) -> Tenant:
-        """Update an existing tenant.
+        """Replace all mutable fields of an existing tenant.
 
-        Note: Tenant model is immutable, so create a new instance with
-        model_copy(update={...}) before calling this method.
+        Because :class:`~fastapi_tenancy.core.types.Tenant` is immutable,
+        callers must first build a modified copy with :meth:`model_copy`::
+
+            updated = tenant.model_copy(update={"name": "New Name"})
+            result  = await store.update(updated)
 
         Args:
-            tenant: Tenant object with updated values
+            tenant: Modified tenant object.  ``tenant.id`` must already exist.
 
         Returns:
-            Updated tenant
+            The updated tenant as stored (timestamps refreshed).
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-            TenancyError: If update fails
-
-        Example:
-            ```python
-            # Get current tenant
-            tenant = await store.get_by_id("123")
-
-            # Create updated version
-            updated = tenant.model_copy(
-                update={"name": "New Name", "status": TenantStatus.ACTIVE}
-            )
-
-            # Save update
-            result = await store.update(updated)
-            ```
+            TenantNotFoundError: When ``tenant.id`` does not exist.
+            TenancyError: On unexpected storage failure.
         """
-        pass
 
     @abstractmethod
     async def delete(self, tenant_id: str) -> None:
-        """Delete a tenant.
+        """Remove a tenant from the store.
 
-        Behavior depends on configuration:
-        - Soft delete: Marks tenant as deleted (if enable_soft_delete=True)
-        - Hard delete: Permanently removes tenant data
+        Behaviour depends on :attr:`~fastapi_tenancy.core.config.TenancyConfig.enable_soft_delete`:
+        implementations may mark the tenant as ``DELETED`` rather than
+        removing the row, depending on application configuration.
 
         Args:
-            tenant_id: Tenant ID to delete
+            tenant_id: ID of the tenant to delete.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-            TenancyError: If deletion fails
-
-        Example:
-            ```python
-            await store.delete("tenant-123")
-            ```
+            TenantNotFoundError: When *tenant_id* does not exist.
+            TenancyError: On unexpected storage failure.
         """
-        pass
 
     @abstractmethod
     async def list(
@@ -191,97 +142,60 @@ class TenantStore(ABC):
         limit: int = 100,
         status: TenantStatus | None = None,
     ) -> Iterable[Tenant]:
-        """List tenants with pagination and optional filtering.
+        """Return a page of tenants, ordered by creation date (newest first).
 
         Args:
-            skip: Number of tenants to skip (for pagination)
-            limit: Maximum number of tenants to return
-            status: Optional filter by status
+            skip: Number of records to skip (offset-based pagination).
+            limit: Maximum number of records to return.
+            status: When provided, only tenants with this status are returned.
 
         Returns:
-            List of tenants
-
-        Example:
-            ```python
-            # Get first page
-            tenants = await store.list(skip=0, limit=10)
-
-            # Get second page
-            tenants = await store.list(skip=10, limit=10)
-
-            # Filter by status
-            active = await store.list(status=TenantStatus.ACTIVE)
-            ```
+            An iterable (usually a :class:`list`) of
+            :class:`~fastapi_tenancy.core.types.Tenant` objects.
         """
-        pass
 
     @abstractmethod
     async def count(self, status: TenantStatus | None = None) -> int:
-        """Count tenants with optional filtering.
+        """Return the total number of tenants, optionally filtered by status.
 
         Args:
-            status: Optional filter by status
+            status: When provided, count only tenants with this status.
 
         Returns:
-            Number of tenants matching criteria
-
-        Example:
-            ```python
-            total = await store.count()
-            active = await store.count(status=TenantStatus.ACTIVE)
-            print(f"Active: {active}/{total}")
-            ```
+            Non-negative integer count.
         """
-        pass
 
     @abstractmethod
     async def exists(self, tenant_id: str) -> bool:
-        """Check if tenant exists.
+        """Return ``True`` if a tenant with *tenant_id* exists.
 
-        This is more efficient than get_by_id() when you only need
-        to check existence without retrieving the full object.
+        More efficient than :meth:`get_by_id` when only existence is needed.
 
         Args:
-            tenant_id: Tenant ID to check
+            tenant_id: Opaque tenant primary key.
 
         Returns:
-            True if tenant exists, False otherwise
-
-        Example:
-            ```python
-            if await store.exists("tenant-123"):
-                print("Tenant exists")
-            ```
+            ``True`` when the tenant exists; ``False`` otherwise.
         """
-        pass
 
     @abstractmethod
     async def set_status(self, tenant_id: str, status: TenantStatus) -> Tenant:
-        """Update tenant status.
+        """Change the lifecycle status of a tenant.
 
-        This is a convenience method for the common operation of
-        changing tenant status (activate, suspend, etc.).
+        This is the preferred method for status transitions (activate,
+        suspend, etc.) because it only touches the status field, leaving
+        all other fields unchanged.
 
         Args:
-            tenant_id: Tenant ID
-            status: New status
+            tenant_id: ID of the tenant to update.
+            status: The new :class:`~fastapi_tenancy.core.types.TenantStatus`.
 
         Returns:
-            Updated tenant
+            The updated tenant.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-
-        Example:
-            ```python
-            # Suspend tenant
-            tenant = await store.set_status("123", TenantStatus.SUSPENDED)
-
-            # Reactivate tenant
-            tenant = await store.set_status("123", TenantStatus.ACTIVE)
-            ```
+            TenantNotFoundError: When *tenant_id* does not exist.
         """
-        pass
 
     @abstractmethod
     async def update_metadata(
@@ -289,65 +203,46 @@ class TenantStore(ABC):
         tenant_id: str,
         metadata: dict[str, Any],
     ) -> Tenant:
-        """Update tenant metadata.
+        """Merge *metadata* into the tenant's existing metadata dictionary.
 
-        Metadata is merged with existing metadata (not replaced).
-        Use this for storing custom tenant properties.
+        The merge is shallow: top-level keys in *metadata* overwrite
+        existing keys; keys absent from *metadata* are preserved.
 
         Args:
-            tenant_id: Tenant ID
-            metadata: Metadata to merge with existing metadata
+            tenant_id: ID of the tenant to update.
+            metadata: Key-value pairs to merge.
 
         Returns:
-            Updated tenant
+            The updated tenant.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-
-        Example:
-            ```python
-            # Add/update metadata
-            tenant = await store.update_metadata(
-                "123",
-                {
-                    "plan": "enterprise",
-                    "max_users": 100,
-                    "features": ["sso", "audit_logs"]
-                }
-            )
-
-            # Access metadata
-            print(tenant.metadata["plan"])  # "enterprise"
-            ```
+            TenantNotFoundError: When *tenant_id* does not exist.
         """
-        pass
+
+    # ------------------------------------------------------------------
+    # Optional batch operations (base implementations provided)
+    # ------------------------------------------------------------------
 
     async def get_by_ids(self, tenant_ids: Iterable[str]) -> Iterable[Tenant]:
-        """Get multiple tenants by IDs (batch operation).
+        """Fetch multiple tenants by their IDs in one call.
 
-        Default implementation calls get_by_id() for each ID.
-        Implementations should override for better performance.
+        The base implementation issues one :meth:`get_by_id` call per ID.
+        **Override this for production backends** to issue a single query.
 
         Args:
-            tenant_ids: List of tenant IDs
+            tenant_ids: Iterable of opaque tenant IDs.
 
         Returns:
-            List of tenants (skips IDs that don't exist)
-
-        Example:
-            ```python
-            ids = ["tenant-1", "tenant-2", "tenant-3"]
-            tenants = await store.get_by_ids(ids)
-            ```
+            Tenants that were found; IDs with no matching tenant are silently
+            skipped.
         """
-        tenants = []
-        for tenant_id in tenant_ids:
+        result: list[Tenant] = []
+        for tid in tenant_ids:
             try:
-                tenant = await self.get_by_id(tenant_id)
-                tenants.append(tenant)
+                result.append(await self.get_by_id(tid))
             except TenantNotFoundError:
                 continue
-        return tenants
+        return result
 
     async def search(
         self,
@@ -355,40 +250,30 @@ class TenantStore(ABC):
         limit: int = 10,
         _scan_limit: int = 100,
     ) -> Iterable[Tenant]:
-        """Search tenants by name or identifier.
+        """Search for tenants whose name or identifier contains *query*.
 
-        Default implementation performs an in-memory scan of the most recent
-        ``_scan_limit`` tenants.  **Production stores should override this
-        method** with a database-level query (e.g. ``WHERE identifier ILIKE
-        :q OR name ILIKE :q``) to avoid loading all tenants into memory.
+        The base implementation loads up to *_scan_limit* records and filters
+        them in Python.  **Override for production backends** with a
+        database-level ``ILIKE``/``LIKE`` query.
 
         Args:
-            query:       Search string (case-insensitive substring match).
-            limit:       Maximum number of results to return.
-            _scan_limit: Maximum tenants fetched for in-memory scan.
-                         Override this method to remove the limit entirely.
+            query: Case-insensitive substring to search for.
+            limit: Maximum number of results to return.
+            _scan_limit: Maximum records fetched for in-memory filtering.
 
         Returns:
-            List of matching :class:`~fastapi_tenancy.core.types.Tenant`
-            objects, up to *limit* results.
+            Matching tenants, up to *limit* results.
 
-        .. warning::
-            The base implementation fetches up to ``_scan_limit`` records
-            (default 100).  For deployments with thousands of tenants,
-            override this method with a database-level search.
-
-        Example:
-            ```python
-            results = await store.search("acme")
-            for tenant in results:
-                print(f"{tenant.identifier}: {tenant.name}")
-            ```
+        Warning:
+            The base implementation is O(n) in the number of tenants.  For
+            deployments with thousands of tenants, implement a database-level
+            search in the concrete subclass.
         """
         query_lower = query.lower()
-        all_tenants = await self.list(skip=0, limit=_scan_limit)
+        candidates = await self.list(skip=0, limit=_scan_limit)
         matches = [
             t
-            for t in all_tenants
+            for t in candidates
             if query_lower in t.identifier.lower() or query_lower in t.name.lower()
         ]
         return matches[:limit]
@@ -398,30 +283,24 @@ class TenantStore(ABC):
         tenant_ids: Iterable[str],
         status: TenantStatus,
     ) -> Iterable[Tenant]:
-        """Update status for multiple tenants (batch operation).
+        """Update the status of multiple tenants in one logical operation.
 
-        Default implementation updates one at a time.
-        Implementations should override for better performance.
+        The base implementation calls :meth:`set_status` once per ID.
+        **Override for production backends** to issue a single SQL ``UPDATE``
+        with an ``IN`` clause.
 
         Args:
-            tenant_ids: List of tenant IDs
-            status: New status for all tenants
+            tenant_ids: IDs of the tenants to update.
+            status: New :class:`~fastapi_tenancy.core.types.TenantStatus`
+                applied to all matched tenants.
 
         Returns:
-            List of updated tenants
-
-        Example:
-            ```python
-            # Suspend multiple tenants
-            ids = ["tenant-1", "tenant-2", "tenant-3"]
-            updated = await store.bulk_update_status(ids, TenantStatus.SUSPENDED)
-            ```
+            Updated tenants; IDs with no matching tenant are silently skipped.
         """
-        updated = []
-        for tenant_id in tenant_ids:
+        updated: list[Tenant] = []
+        for tid in tenant_ids:
             try:
-                tenant = await self.set_status(tenant_id, status)
-                updated.append(tenant)
+                updated.append(await self.set_status(tid, status))
             except TenantNotFoundError:
                 continue
         return updated

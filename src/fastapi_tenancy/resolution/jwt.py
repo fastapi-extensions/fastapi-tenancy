@@ -1,10 +1,34 @@
 """JWT-based tenant resolution strategy.
 
-Resolves tenant from JWT token claims.
+Extracts the tenant identifier from a claim inside a Bearer JWT token
+provided in the ``Authorization`` request header.
 
+Example JWT payload::
+
+    {
+        "sub": "user-abc",
+        "tenant_id": "acme-corp",
+        "roles": ["admin"],
+        "exp": 1893456000
+    }
+
+Security notes
+--------------
+* Validation failures always return a generic ``"JWT validation failed"``
+  error message.  Internal details (claim names, token contents, algorithm
+  specifics) are logged at ``WARNING`` level for operators but are never
+  exposed to callers.
+* Tokens are verified using the configured ``secret`` and ``algorithm``.
+  Never set ``algorithm`` to ``"none"``; the underlying library rejects this,
+  but application code must never pass untrusted algorithm values from the
+  token header.
+
+Installation
+------------
 Requires the ``jwt`` extra::
 
     pip install fastapi-tenancy[jwt]
+    # which installs: python-jose[cryptography]
 """
 
 from __future__ import annotations
@@ -13,12 +37,13 @@ import logging
 from typing import TYPE_CHECKING
 
 try:
-    from jose import JWTError, jwt
+    from jose import JWTError, jwt as _jose_jwt
+
     _JOSE_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _JOSE_AVAILABLE = False
     JWTError = Exception  # type: ignore[misc, assignment]
-    jwt = None  # type: ignore[assignment]
+    _jose_jwt = None  # type: ignore[assignment]
 
 from fastapi_tenancy.core.exceptions import TenantResolutionError
 from fastapi_tenancy.resolution.base import BaseTenantResolver
@@ -33,23 +58,30 @@ logger = logging.getLogger(__name__)
 
 
 class JWTTenantResolver(BaseTenantResolver):
-    """Resolve tenant from JWT token.
+    """Resolve tenant from a JWT Bearer token claim.
 
-    This resolver extracts the tenant identifier from a claim in the JWT token.
+    Reads the ``Authorization: Bearer <token>`` header, validates the JWT,
+    and extracts the configured tenant claim.
 
-    Example JWT payload::
+    Args:
+        secret: Signing secret (HS256) or public key (RS256 / EC).
+        algorithm: JWT signing algorithm.  Defaults to ``"HS256"``.
+        tenant_claim: Name of the JWT payload claim containing the tenant
+            identifier.  Defaults to ``"tenant_id"``.
+        tenant_store: Storage backend for tenant lookup.
 
-        {
-            "sub": "user-123",
-            "tenant_id": "acme-corp",
-            "exp": 1234567890
-        }
+    Raises:
+        ImportError: When ``python-jose`` is not installed.
+        ValueError: When ``secret`` is empty or shorter than 32 characters.
 
-    Attributes:
-        secret: JWT secret key for validation
-        algorithm: JWT signing algorithm
-        tenant_claim: Name of claim containing tenant ID
-        tenant_store: Storage backend
+    Example::
+
+        resolver = JWTTenantResolver(
+            secret=os.environ["JWT_SECRET"],
+            tenant_claim="tenant_id",
+            tenant_store=store,
+        )
+        tenant = await resolver.resolve(request)
     """
 
     def __init__(
@@ -59,13 +91,6 @@ class JWTTenantResolver(BaseTenantResolver):
         tenant_claim: str = "tenant_id",
         tenant_store: TenantStore | None = None,
     ) -> None:
-        """Initialize JWT resolver.
-
-        Raises:
-            ImportError: If ``python-jose`` is not installed
-                (``pip install fastapi-tenancy[jwt]``).
-            ValueError: If ``secret`` is empty.
-        """
         if not _JOSE_AVAILABLE:
             raise ImportError(
                 "JWTTenantResolver requires the 'jwt' extra: "
@@ -73,63 +98,96 @@ class JWTTenantResolver(BaseTenantResolver):
             )
         if not secret:
             raise ValueError(
-                "JWTTenantResolver requires a non-empty secret key."
+                "JWTTenantResolver requires a non-empty JWT secret."
             )
+        if len(secret) < 32:
+            raise ValueError(
+                "JWT secret must be at least 32 characters long for adequate security."
+            )
+
         super().__init__(tenant_store)
-        self.secret = secret
-        self.algorithm = algorithm
-        self.tenant_claim = tenant_claim
-        logger.info("Initialized JWTTenantResolver with claim=%r", tenant_claim)
+        self._secret = secret
+        self._algorithm = algorithm
+        self._claim = tenant_claim
+        logger.debug(
+            "JWTTenantResolver algorithm=%r tenant_claim=%r", algorithm, tenant_claim
+        )
 
     async def resolve(self, request: Request) -> Tenant:
-        """Resolve tenant from JWT token."""
-        # Extract token from Authorization header
+        """Validate the Bearer JWT and extract the tenant identifier from its payload.
+
+        Args:
+            request: Incoming FastAPI / Starlette request.
+
+        Returns:
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
+
+        Raises:
+            TenantResolutionError: When the ``Authorization`` header is absent,
+                malformed, the token is invalid / expired, or the tenant claim
+                is missing.
+            TenantNotFoundError: When no tenant matches the extracted identifier.
+        """
+        # Extract Authorization header
         auth_header = request.headers.get("Authorization")
         if not auth_header:
             raise TenantResolutionError(
-                reason="Authorization header not found",
+                reason="Authorization header is not present in the request.",
                 strategy="jwt",
             )
 
-        # Extract Bearer token
-        parts = auth_header.split()
+        parts = auth_header.split(maxsplit=1)
         if len(parts) != 2 or parts[0].lower() != "bearer":
             raise TenantResolutionError(
-                reason="Invalid Authorization header format. Expected: Bearer <token>",
+                reason="Authorization header must use the Bearer scheme.",
                 strategy="jwt",
             )
 
-        token = parts[1]
+        token = parts[1].strip()
+        if not token:
+            raise TenantResolutionError(
+                reason="Bearer token is empty.",
+                strategy="jwt",
+            )
 
-        # Decode and validate JWT — log the internal reason, never expose it
+        # Validate and decode JWT
         try:
-            payload = jwt.decode(token, self.secret, algorithms=[self.algorithm])
-        except JWTError as e:
-            logger.warning("JWT validation failed: %s", e)
+            payload: dict = _jose_jwt.decode( # type: ignore
+                token,
+                self._secret,
+                algorithms=[self._algorithm],
+            )
+        except JWTError as exc:
+            # Log the real reason for operators; return generic message to caller.
+            logger.warning("JWT validation failed: %s", exc)
             raise TenantResolutionError(
-                reason="JWT validation failed",
+                reason="JWT validation failed.",
                 strategy="jwt",
-            ) from e
+            ) from exc
 
-        # Extract tenant ID from claim — do not return claim names to the caller
-        tenant_id = payload.get(self.tenant_claim)
-        if not tenant_id:
+        # Extract tenant claim
+        raw_claim = payload.get(self._claim)
+        if not raw_claim:
+            # Log claim name for operators; never return claim names to caller
+            # to avoid leaking JWT structure to untrusted clients.
             logger.warning(
-                "JWT missing required claim %r (available claims omitted for security)",
-                self.tenant_claim,
+                "JWT payload missing required claim %r — available claims omitted",
+                self._claim,
             )
             raise TenantResolutionError(
-                reason="JWT token does not contain the required tenant claim",
+                reason="JWT token does not contain the required tenant claim.",
                 strategy="jwt",
             )
 
-        if not self.validate_tenant_identifier(str(tenant_id)):
+        identifier = str(raw_claim).strip()
+        if not self.validate_tenant_identifier(identifier):
             raise TenantResolutionError(
-                reason="Invalid tenant identifier format in JWT claim",
+                reason="Tenant identifier extracted from JWT claim has an invalid format.",
                 strategy="jwt",
             )
 
-        return await self.get_tenant_by_identifier(tenant_id)
+        logger.debug("Resolving tenant from JWT claim=%r identifier=%r", self._claim, identifier)
+        return await self.get_tenant_by_identifier(identifier)
 
 
 __all__ = ["JWTTenantResolver"]

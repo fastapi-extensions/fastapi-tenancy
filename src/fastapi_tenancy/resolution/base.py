@@ -1,6 +1,28 @@
-"""Base tenant resolver implementation.
+"""Abstract base class for tenant resolution strategies.
 
-This module provides the base class and utilities for tenant resolution strategies.
+All resolution strategies — header, subdomain, path, JWT, and custom — derive
+from :class:`BaseTenantResolver` and implement a single abstract method:
+:meth:`resolve`.  The base class provides common helpers for store lookup and
+identifier validation so concrete implementations stay thin.
+
+Extension pattern::
+
+    from fastapi_tenancy.resolution.base import BaseTenantResolver
+    from fastapi_tenancy.core.exceptions import TenantResolutionError
+
+    class CookieTenantResolver(BaseTenantResolver):
+        def __init__(self, cookie_name: str, tenant_store: TenantStore) -> None:
+            super().__init__(tenant_store)
+            self._cookie = cookie_name
+
+        async def resolve(self, request: Request) -> Tenant:
+            value = request.cookies.get(self._cookie)
+            if not value:
+                raise TenantResolutionError(
+                    reason="Tenant cookie not found",
+                    strategy="cookie",
+                )
+            return await self.get_tenant_by_identifier(value)
 """
 
 from __future__ import annotations
@@ -21,127 +43,92 @@ logger = logging.getLogger(__name__)
 class BaseTenantResolver(ABC):
     """Abstract base class for tenant resolution strategies.
 
-    All tenant resolvers must inherit from this class and implement
-    the resolve() method. This provides a consistent interface for
-    different resolution strategies.
+    Concrete subclasses must implement :meth:`resolve`.  The base class
+    supplies :meth:`get_tenant_by_identifier` and
+    :meth:`validate_tenant_identifier` as shared utilities.
 
-    The base class also provides common functionality:
-    - Tenant lookup from storage
-    - Logging and error handling
-    - Caching support (optional)
-
-    Subclasses should implement:
-    - resolve(): Extract tenant identifier from request
-    - get_tenant_by_identifier(): Lookup tenant (can override for custom logic)
-
-    Example:
-        ```python
-        class CustomResolver(BaseTenantResolver):
-            def __init__(self, tenant_store: TenantStore):
-                super().__init__(tenant_store)
-
-            async def resolve(self, request: Request) -> Tenant:
-                # Extract tenant ID from custom header
-                tenant_id = request.headers.get("X-Custom-Tenant")
-                if not tenant_id:
-                    raise TenantResolutionError("Missing custom header")
-
-                # Lookup tenant
-                return await self.get_tenant_by_identifier(tenant_id)
-        ```
-
-    Attributes:
-        tenant_store: Storage backend for tenant lookup
+    Args:
+        tenant_store: Storage backend used by :meth:`get_tenant_by_identifier`.
+            May be ``None`` for resolvers that embed the tenant ID directly in
+            the request (e.g. a signed JWT) without a secondary store lookup —
+            though most strategies will require a store.
     """
 
     def __init__(self, tenant_store: TenantStore | None = None) -> None:
-        """Initialize base resolver.
+        self._store = tenant_store
+        logger.debug("Initialised %s", type(self).__name__)
 
-        Args:
-            tenant_store: Optional tenant storage backend for lookups
-        """
-        self.tenant_store = tenant_store
-        logger.debug("Initialized %s", self.__class__.__name__)
+    # ------------------------------------------------------------------
+    # Abstract interface
+    # ------------------------------------------------------------------
 
     @abstractmethod
     async def resolve(self, request: Any) -> Tenant:
-        """Resolve tenant from request.
-
-        This is the main method that must be implemented by all resolvers.
-        It should extract tenant information from the request and return
-        the corresponding Tenant object.
+        """Extract and return the current tenant from *request*.
 
         Args:
-            request: FastAPI request object
+            request: A FastAPI / Starlette :class:`~starlette.requests.Request`.
 
         Returns:
-            Resolved tenant
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantResolutionError: If tenant cannot be resolved from request
-            TenantNotFoundError: If tenant does not exist
+            TenantResolutionError: When the request does not carry sufficient
+                information to identify a tenant.
+            TenantNotFoundError: When the identifier is valid but matches no
+                known tenant.
         """
-        pass
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
 
     async def get_tenant_by_identifier(self, identifier: str) -> Tenant:
-        """Get tenant by identifier using storage backend.
-
-        This is a helper method that resolvers can use to lookup tenants.
-        It can be overridden for custom lookup logic or caching.
+        """Look up *identifier* in the configured store and return the tenant.
 
         Args:
-            identifier: Tenant identifier to lookup
+            identifier: Human-readable tenant slug.
 
         Returns:
-            Tenant object
+            The matching :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
-            ValueError: If no tenant store configured
-
-        Example:
-            ```python
-            async def resolve(self, request: Request) -> Tenant:
-                tenant_id = extract_from_request(request)
-                return await self.get_tenant_by_identifier(tenant_id)
-            ```
+            ValueError: When no store was configured.
+            TenantNotFoundError: When no tenant with *identifier* exists.
         """
-        if not self.tenant_store:
+        if self._store is None:
             raise ValueError(
-                f"{self.__class__.__name__} requires tenant_store to be configured"
+                f"{type(self).__name__} requires a tenant_store to be configured."
             )
-
         try:
-            tenant = await self.tenant_store.get_by_identifier(identifier)
+            tenant = await self._store.get_by_identifier(identifier)
             logger.debug(
-                "Resolved tenant %r to %s using %s",
-                identifier, tenant.id, self.__class__.__name__,
+                "Resolved identifier=%r to tenant id=%s via %s",
+                identifier,
+                tenant.id,
+                type(self).__name__,
             )
             return tenant
         except TenantNotFoundError:
             logger.warning(
-                "Tenant not found: %r using %s",
-                identifier, self.__class__.__name__,
+                "Tenant not found: identifier=%r strategy=%s",
+                identifier,
+                type(self).__name__,
             )
             raise
 
-    def validate_tenant_identifier(self, identifier: str) -> bool:
-        """Validate tenant identifier format.
+    @staticmethod
+    def validate_tenant_identifier(identifier: str) -> bool:
+        """Return ``True`` if *identifier* passes the tenant slug validation rules.
 
-        This provides basic validation that can be overridden by subclasses
-        for strategy-specific validation.
+        Delegates to :func:`~fastapi_tenancy.utils.validation.validate_tenant_identifier`
+        so validation is consistent across the entire library.
 
         Args:
-            identifier: Tenant identifier to validate
+            identifier: Value to validate.
 
         Returns:
-            True if valid, False otherwise
-
-        Example:
-            ```python
-            if not self.validate_tenant_identifier(tenant_id):
-                raise TenantResolutionError("Invalid tenant ID format")
-            ```
+            ``True`` when *identifier* is a valid tenant slug.
         """
         from fastapi_tenancy.utils.validation import validate_tenant_identifier
 

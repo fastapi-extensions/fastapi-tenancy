@@ -1,43 +1,50 @@
-"""Storage implementations for tenant data.
+"""Tenant storage backends for fastapi-tenancy.
 
-This module provides multiple storage backends for tenant metadata:
-- PostgreSQL: Production persistent storage
-- Redis: High-performance caching layer
-- In-Memory: Testing and development
+All backends implement :class:`~fastapi_tenancy.storage.tenant_store.TenantStore`
+and are fully interchangeable.
 
-Example:
-    ```python
-    # Production: PostgreSQL with Redis cache
-    from fastapi_tenancy.storage.postgres import PostgreSQLTenantStore
-    from fastapi_tenancy.storage.redis import RedisTenantStore
+Backends
+--------
+:class:`~fastapi_tenancy.storage.database.SQLAlchemyTenantStore`
+    Recommended production backend.  Async SQLAlchemy 2.0 supporting
+    PostgreSQL (asyncpg), SQLite (aiosqlite), MySQL (aiomysql), and MSSQL.
 
-    primary = PostgreSQLTenantStore(
-        database_url="postgresql+asyncpg://localhost/tenancy"
+:class:`~fastapi_tenancy.storage.memory.InMemoryTenantStore`
+    In-memory store for tests and local development.  No I/O; data is
+    lost when the process exits.
+
+:class:`~fastapi_tenancy.storage.redis.RedisTenantStore`
+    Redis write-through cache layer wrapping any primary store.
+    Requires the ``redis`` extra.
+
+Example — production with Redis cache::
+
+    from fastapi_tenancy.storage import SQLAlchemyTenantStore, RedisTenantStore
+
+    primary = SQLAlchemyTenantStore(
+        database_url="postgresql+asyncpg://user:pass@localhost/myapp"
     )
     await primary.initialize()
 
-    cache = RedisTenantStore(
+    store = RedisTenantStore(
         redis_url="redis://localhost:6379/0",
         primary_store=primary,
         ttl=3600,
     )
 
-    # Use cache layer (automatically uses primary on miss)
-    tenant = await cache.get_by_id("123")
+Example — testing::
 
-    # Development: In-Memory
-    from fastapi_tenancy.storage.memory import InMemoryTenantStore
+    from fastapi_tenancy.storage import InMemoryTenantStore
 
     store = InMemoryTenantStore()
-    tenant = await store.create(Tenant(...))
-    ```
+    await store.create(Tenant(id="t1", identifier="acme", name="Acme Corp"))
 """
 
+from fastapi_tenancy.storage.database import SQLAlchemyTenantStore, TenantModel
 from fastapi_tenancy.storage.memory import InMemoryTenantStore
-from fastapi_tenancy.storage.postgres import PostgreSQLTenantStore, TenantModel
 from fastapi_tenancy.storage.tenant_store import TenantStore
 
-# Optional — requires: pip install fastapi-tenancy[redis]
+# Redis is optional — requires: pip install fastapi-tenancy[redis]
 try:
     from fastapi_tenancy.storage.redis import RedisTenantStore
 except ImportError:
@@ -45,8 +52,8 @@ except ImportError:
 
 __all__ = [
     "InMemoryTenantStore",
-    "PostgreSQLTenantStore",
     "RedisTenantStore",
+    "SQLAlchemyTenantStore",
     "TenantModel",
     "TenantStore",
 ]

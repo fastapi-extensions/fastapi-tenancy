@@ -1,17 +1,22 @@
 """Row-Level Security (RLS) isolation — multi-database compatible.
 
-PostgreSQL
-    Sets ``app.current_tenant`` session variable; RLS policies filter rows.
-    Adds explicit ``WHERE tenant_id = :id`` as defence-in-depth.
+Dialect behaviour
+-----------------
++------------------+---------------------------------------+-------------------------------+
+| Dialect          | Session configuration                 | Primary filter                |
++==================+=======================================+===============================+
+| PostgreSQL       | ``SET app.current_tenant = :id``      | DB-level RLS + WHERE clause   |
++------------------+---------------------------------------+-------------------------------+
+| MySQL            | ``SET @current_tenant = :id``         | Explicit WHERE clause         |
++------------------+---------------------------------------+-------------------------------+
+| SQLite / other   | ``session.info["tenant_id"] = id``    | Explicit WHERE clause         |
++------------------+---------------------------------------+-------------------------------+
 
-MySQL / MariaDB
-    Sets ``@current_tenant`` user-defined variable for stored-procedure use.
-    Explicit ``WHERE tenant_id = :id`` filter applied on every query.
-
-SQLite / Other dialects
-    No session variable support.  Pure explicit-filter mode.
-    Adds ``WHERE tenant_id = :id`` to every query via ``apply_filters()``.
+The ``WHERE tenant_id = :id`` filter applied by :meth:`apply_filters` acts as
+defence-in-depth even for PostgreSQL where RLS policies are the primary guard.
+All filters use bound parameters — never string interpolation.
 """
+
 from __future__ import annotations
 
 import logging
@@ -43,28 +48,32 @@ logger = logging.getLogger(__name__)
 
 
 class RLSIsolationProvider(BaseIsolationProvider):
-    """RLS-style isolation — gracefully degrades on non-PostgreSQL databases.
+    """RLS-style isolation with automatic dialect-based degradation.
 
-    On PostgreSQL the ``SET app.current_tenant`` call activates RLS policies
-    configured on your tables.  On all other databases the provider falls back
-    to explicit ``WHERE tenant_id = :id`` query filtering (via
-    :meth:`apply_filters`) and logs a one-time warning.
+    On PostgreSQL, ``SET app.current_tenant`` activates server-side RLS
+    policies.  On all other databases the provider falls back to explicit
+    ``WHERE tenant_id = :id`` filtering via :meth:`apply_filters`.
 
-    Example (PostgreSQL)
-    --------------------
-    .. code-block:: sql
+    A one-time warning is emitted when initialised on a non-PostgreSQL
+    dialect so operators are aware that native RLS is not active.
 
-        -- One-time DDL per table
+    PostgreSQL setup (one-time DDL per tenant-scoped table)::
+
         ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE orders FORCE ROW LEVEL SECURITY;
         CREATE POLICY tenant_isolation ON orders
-          USING (tenant_id = current_setting('app.current_tenant'));
+            USING (tenant_id = current_setting('app.current_tenant'));
 
-    Example (SQLite / non-PG)
-    --------------------------
-    .. code-block:: python
+    Args:
+        config: Tenancy configuration.
+        engine: Optional pre-built engine (avoids a duplicate pool when
+            used inside :class:`~fastapi_tenancy.isolation.hybrid.HybridIsolationProvider`).
+
+    Example::
+
+        provider = RLSIsolationProvider(config)
 
         async with provider.get_session(tenant) as session:
-            # apply_filters adds WHERE automatically
             q = await provider.apply_filters(select(Order), tenant)
             result = await session.execute(q)
     """
@@ -75,7 +84,7 @@ class RLSIsolationProvider(BaseIsolationProvider):
 
         if not supports_native_rls(self.dialect):
             logger.warning(
-                "RLSIsolationProvider: dialect %s does not support native RLS. "
+                "RLSIsolationProvider: dialect=%s does not support native RLS. "
                 "Falling back to explicit WHERE tenant_id filter. "
                 "Ensure apply_filters() is called on every query.",
                 self.dialect.value,
@@ -94,7 +103,6 @@ class RLSIsolationProvider(BaseIsolationProvider):
                 kw["pool_timeout"] = config.database_pool_timeout
                 kw["pool_recycle"] = config.database_pool_recycle
                 kw["pool_pre_ping"] = True
-
             self.engine = create_async_engine(str(config.database_url), **kw)
 
         logger.info(
@@ -105,39 +113,36 @@ class RLSIsolationProvider(BaseIsolationProvider):
 
     @asynccontextmanager
     async def get_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
-        """Yield a session with tenant context configured.
+        """Yield a session with the tenant context variable configured.
 
-        For PostgreSQL: sets ``app.current_tenant`` session variable.
-        For MySQL: sets ``@current_tenant`` user variable.
-        For others: attaches tenant_id to ``session.info`` for use by
-        :meth:`apply_filters`.
+        Args:
+            tenant: The currently active tenant.
+
+        Yields:
+            A configured :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
+
+        Raises:
+            IsolationError: When the session cannot be opened or the tenant
+                context variable cannot be set.
         """
-        set_sql = get_set_tenant_sql(self.dialect, tenant.id)
-
+        set_sql = get_set_tenant_sql(self.dialect)
         async with AsyncSession(self.engine, expire_on_commit=False) as session:
             try:
                 if set_sql:
-                    await session.execute(
-                        text(set_sql),
-                        {"tenant_id": tenant.id},
-                    )
+                    await session.execute(text(set_sql), {"tenant_id": tenant.id})
                     logger.debug(
                         "Set tenant context tenant=%s dialect=%s",
-                        tenant.id, self.dialect.value,
+                        tenant.id,
+                        self.dialect.value,
                     )
                 else:
-                    # Store tenant_id in session.info for apply_filters
+                    # Store in session.info for apply_filters() on non-RLS dialects.
                     session.info["tenant_id"] = tenant.id
-
                 yield session
-
             except IsolationError:
                 raise
             except Exception as exc:
                 await session.rollback()
-                logger.error(
-                    "RLS session error tenant=%s: %s", tenant.id, exc, exc_info=True
-                )
                 raise IsolationError(
                     operation="get_session",
                     tenant_id=tenant.id,
@@ -145,28 +150,37 @@ class RLSIsolationProvider(BaseIsolationProvider):
                 ) from exc
 
     async def apply_filters(self, query: Any, tenant: Tenant) -> Any:
-        """Apply explicit ``WHERE tenant_id = :tenant_id`` bound-parameter filter.
+        """Return *query* with ``WHERE tenant_id = :id`` appended.
 
-        Called as defence-in-depth for PostgreSQL RLS and as the primary
-        isolation mechanism for all other dialects.
+        Uses a SQLAlchemy bound parameter — never string interpolation.
 
-        Uses ``sqlalchemy.column()`` so the tenant ID is always passed as a
-        proper bind parameter — never interpolated into the SQL string.
+        Args:
+            query: SQLAlchemy Core or ORM query.
+            tenant: Currently active tenant.
 
-        If *query* is a SQLAlchemy Core/ORM construct with a ``.where()``
-        method the filter is applied.  Raw ``text()`` queries are returned
-        unchanged — callers must add ``.bindparams(tenant_id=...)`` themselves.
+        Returns:
+            Filtered query (or *query* unchanged if it has no ``.where()``).
         """
         if hasattr(query, "where"):
             from sqlalchemy import column
+
             return query.where(column("tenant_id") == tenant.id)
         return query
 
     async def initialize_tenant(self, tenant: Tenant) -> None:
-        """No structural initialisation needed for RLS / explicit-filter mode."""
+        """No structural provisioning required for RLS / filter mode.
+
+        The application is responsible for creating RLS policies via manual
+        DDL migrations.  This method logs readiness information only.
+
+        Args:
+            tenant: Newly created tenant.
+        """
         logger.info(
-            "RLS/filter tenant %s ready (dialect=%s, native_rls=%s)",
-            tenant.id, self.dialect.value, supports_native_rls(self.dialect),
+            "RLS tenant %s ready (dialect=%s native_rls=%s)",
+            tenant.id,
+            self.dialect.value,
+            supports_native_rls(self.dialect),
         )
 
     async def destroy_tenant(
@@ -178,42 +192,19 @@ class RLSIsolationProvider(BaseIsolationProvider):
     ) -> None:
         """Delete all rows belonging to *tenant* from the shared tables.
 
-        RLS isolation shares tables across all tenants — rows are distinguished
-        by a ``tenant_id`` column.  This method deletes those rows.
+        Either ``table_names`` or ``metadata`` must be supplied so the
+        provider knows which tables to purge.
 
-        You **must** supply either ``table_names`` or ``metadata`` so the
-        provider knows which tables to purge.  Without at least one of these
-        arguments the method raises :class:`~fastapi_tenancy.core.exceptions.IsolationError`
-        rather than silently doing nothing.
+        Args:
+            tenant: The tenant whose data should be deleted.
+            table_names: Explicit list of table names to purge.
+            metadata: Application :class:`~sqlalchemy.MetaData`.  Tables with
+                a ``tenant_id`` column are purged automatically.
 
-        Parameters
-        ----------
-        tenant:
-            The tenant whose data should be deleted.
-        table_names:
-            Explicit list of table names to purge (e.g. ``["users", "orders"]``).
-        metadata:
-            SQLAlchemy :class:`~sqlalchemy.MetaData`; all ``Table`` objects
-            that have a ``tenant_id`` column will be purged.
-
-        Raises
-        ------
-        IsolationError
-            If no table information is provided, or if a DELETE fails.
-
-        Example
-        -------
-        .. code-block:: python
-
-            # Using table_names
-            await provider.destroy_tenant(tenant, table_names=["users", "orders"])
-
-            # Using ORM metadata
-            from myapp.models import Base
-            await provider.destroy_tenant(tenant, metadata=Base.metadata)
+        Raises:
+            IsolationError: When neither ``table_names`` nor ``metadata`` is
+                provided, or when a DELETE statement fails.
         """
-        from sqlalchemy import text as sa_text
-
         from fastapi_tenancy.utils.validation import assert_safe_schema_name
 
         if table_names is None and metadata is None:
@@ -222,58 +213,46 @@ class RLSIsolationProvider(BaseIsolationProvider):
                 tenant_id=tenant.id,
                 details={
                     "reason": (
-                        "RLS destroy_tenant requires either table_names= or metadata= "
-                        "to know which tables to purge.  Pass the application metadata "
-                        "or an explicit list of table names."
+                        "RLS destroy_tenant requires either table_names= or metadata=. "
+                        "Pass the application metadata or an explicit list of table names."
                     )
                 },
             )
 
-        tables_to_purge: list[str] = list(table_names or [])
-
+        tables: list[str] = list(table_names or [])
         if metadata is not None:
-            for table in metadata.sorted_tables:
-                if "tenant_id" in table.c:
-                    tables_to_purge.append(table.name)
+            for t in metadata.sorted_tables:
+                if "tenant_id" in t.c:
+                    tables.append(t.name)
 
-        if not tables_to_purge:
+        if not tables:
             logger.warning(
-                "destroy_tenant called for tenant %s but no tables with "
-                "tenant_id column were found — nothing deleted.",
+                "destroy_tenant: no tables with tenant_id found for tenant %s",
                 tenant.id,
             )
             return
 
         async with AsyncSession(self.engine, expire_on_commit=False) as session:
             try:
-                for tbl_name in tables_to_purge:
-                    # Use parameterised DELETE to avoid injection via table names.
-                    # Table names cannot be parameterised in SQL, but they are
-                    # validated above (either from metadata or caller-supplied).
-                    # We still quote them defensively.
+                for tbl in tables:
                     try:
-                        assert_safe_schema_name(tbl_name, context="destroy_tenant")
+                        assert_safe_schema_name(tbl, context="destroy_tenant")
                     except ValueError as exc:
                         raise IsolationError(
                             operation="destroy_tenant",
                             tenant_id=tenant.id,
-                            details={"table": tbl_name, "error": str(exc)},
+                            details={"table": tbl, "error": str(exc)},
                         ) from exc
-
                     await session.execute(
-                        sa_text(f'DELETE FROM "{tbl_name}" WHERE tenant_id = :tid'),  # noqa: S608
+                        text(f'DELETE FROM "{tbl}" WHERE tenant_id = :tid'),  # noqa: S608
                         {"tid": tenant.id},
                     )
-                    logger.info(
-                        "Deleted rows from %r for tenant %s", tbl_name, tenant.id
-                    )
-
+                    logger.info("Deleted rows from %r for tenant %s", tbl, tenant.id)
                 await session.commit()
                 logger.warning(
-                    "destroy_tenant completed for tenant %s: purged %d tables %s",
+                    "destroy_tenant completed: purged %d tables for tenant %s",
+                    len(tables),
                     tenant.id,
-                    len(tables_to_purge),
-                    tables_to_purge,
                 )
             except IsolationError:
                 await session.rollback()
@@ -283,12 +262,13 @@ class RLSIsolationProvider(BaseIsolationProvider):
                 raise IsolationError(
                     operation="destroy_tenant",
                     tenant_id=tenant.id,
-                    details={"tables": tables_to_purge, "error": str(exc)},
+                    details={"tables": tables, "error": str(exc)},
                 ) from exc
 
     async def close(self) -> None:
-        logger.info("Closing RLSIsolationProvider engine")
+        """Dispose the engine and release pooled connections."""
         await self.engine.dispose()
+        logger.info("RLSIsolationProvider closed")
 
 
 __all__ = ["RLSIsolationProvider"]

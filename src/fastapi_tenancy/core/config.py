@@ -1,7 +1,23 @@
-"""Configuration management for FastAPI Tenancy.
+"""Configuration management for fastapi-tenancy.
 
-This module provides comprehensive configuration with environment variable support,
-validation, and type safety using Pydantic Settings.
+:class:`TenancyConfig` is a :class:`~pydantic_settings.BaseSettings` model
+that reads its values from environment variables (prefix ``TENANCY_``), an
+optional ``.env`` file, or explicit keyword arguments.
+
+All cross-field consistency checks run inside :meth:`model_post_init` so
+a misconfigured :class:`TenancyConfig` raises immediately at construction
+time rather than during the first request.
+
+Environment variables
+---------------------
+Every field can be overridden by an environment variable named
+``TENANCY_<FIELD_NAME_UPPER>``.  For example::
+
+    TENANCY_DATABASE_URL=postgresql+asyncpg://user:pass@localhost/myapp
+    TENANCY_RESOLUTION_STRATEGY=header
+    TENANCY_ISOLATION_STRATEGY=schema
+    TENANCY_CACHE_ENABLED=true
+    TENANCY_REDIS_URL=redis://localhost:6379/0
 """
 
 from __future__ import annotations
@@ -16,36 +32,29 @@ from fastapi_tenancy.core.types import IsolationStrategy, ResolutionStrategy
 
 
 class TenancyConfig(BaseSettings):
-    """Main configuration for FastAPI Tenancy.
+    """Central configuration for the fastapi-tenancy library.
 
-    All settings can be configured via environment variables with TENANCY_ prefix.
-    Supports .env file loading for local development.
+    Instances are validated eagerly: invalid field values and inconsistent
+    field combinations both raise :class:`ValueError` (or
+    :class:`~pydantic.ValidationError`) at construction time.
 
-    Example:
-        ```python
-        # Using environment variables
-        # TENANCY_RESOLUTION_STRATEGY=header
-        # TENANCY_ISOLATION_STRATEGY=schema
-        # TENANCY_DATABASE_URL=postgresql+asyncpg://...
+    Example — programmatic::
 
-        config = TenancyConfig()
-
-        # Or programmatically
         config = TenancyConfig(
-            database_url="postgresql+asyncpg://localhost/db",
+            database_url="postgresql+asyncpg://user:pass@localhost/myapp",
             resolution_strategy="header",
             isolation_strategy="schema",
         )
-        ```
 
-    Attributes:
-        resolution_strategy: Strategy for resolving tenant from requests
-        isolation_strategy: Strategy for isolating tenant data
-        database_url: Primary database connection URL
-        redis_url: Redis connection URL for caching
-        cache_enabled: Enable/disable caching layer
-        enable_metrics: Enable metrics collection
-        enable_audit_logging: Enable audit logging
+    Example — environment variables::
+
+        # .env
+        TENANCY_DATABASE_URL=postgresql+asyncpg://user:pass@localhost/myapp
+        TENANCY_RESOLUTION_STRATEGY=subdomain
+        TENANCY_DOMAIN_SUFFIX=.example.com
+        TENANCY_ISOLATION_STRATEGY=rls
+
+        config = TenancyConfig()  # reads from environment / .env
     """
 
     model_config = SettingsConfigDict(
@@ -57,515 +66,483 @@ class TenancyConfig(BaseSettings):
     )
 
     def __str__(self) -> str:
-        """String representation with masked secrets."""
-        result = super().__repr__()
-        # Mask passwords in URLs
-        result = re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", result)
-        # Mask secret values
-        result = re.sub(
+        """Return a masked string representation safe for logging."""
+        text = super().__repr__()
+        # Mask passwords in connection URLs (postgresql://user:SECRET@host/db)
+        text = re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", text)
+        # Mask named secret fields
+        text = re.sub(
             r"(jwt_secret|encryption_key|secret|password|key)=(?:'[^']*'|[^\s,)]+)",
             r"\1='***'",
-            result,
+            text,
             flags=re.IGNORECASE,
         )
-        return result
+        return text
 
-    #########################
-    # Core Tenancy Settings #
-    #########################
+    # ------------------------------------------------------------------
+    # Core strategy
+    # ------------------------------------------------------------------
 
     resolution_strategy: ResolutionStrategy = Field(
         default=ResolutionStrategy.HEADER,
-        description="Strategy for resolving tenant from requests",
+        description="Strategy used to extract the tenant identifier from incoming requests.",
     )
 
     isolation_strategy: IsolationStrategy = Field(
         default=IsolationStrategy.SCHEMA,
-        description="Strategy for isolating tenant data",
+        description="Strategy used to isolate each tenant's data at the database layer.",
     )
 
-    ##########################
-    # Database Configuration #
-    ##########################
+    # ------------------------------------------------------------------
+    # Database
+    # ------------------------------------------------------------------
 
     database_url: str = Field(
         ...,
-        description="Primary database connection URL (required)",
+        description=(
+            "Async SQLAlchemy connection URL.  Use an async driver: "
+            "postgresql+asyncpg, sqlite+aiosqlite, mysql+aiomysql."
+        ),
     )
 
     database_pool_size: int = Field(
         default=20,
         ge=1,
         le=100,
-        description="Database connection pool size",
+        description="Number of persistent connections in the pool.",
     )
 
     database_max_overflow: int = Field(
         default=40,
         ge=0,
         le=200,
-        description="Max overflow connections beyond pool size",
+        description="Extra connections allowed beyond pool_size under peak load.",
     )
 
     database_pool_timeout: int = Field(
         default=30,
         ge=1,
-        description="Pool checkout timeout in seconds",
+        description="Seconds to wait for a pool connection before raising.",
     )
 
     database_pool_recycle: int = Field(
         default=3600,
         ge=60,
-        description="Connection recycle time in seconds (prevents stale connections)",
+        description="Seconds after which a connection is proactively replaced.",
     )
 
     database_echo: bool = Field(
         default=False,
-        description="Enable SQL query logging (use only in development)",
+        description="Log every SQL statement.  Enable only during development.",
     )
 
-    # Database per Tenant Settings (for DATABASE isolation strategy)
     database_url_template: str | None = Field(
         default=None,
-        description="Template for per-tenant database URLs. Use {tenant_id} or {database_name}",
+        description=(
+            "URL template for per-tenant databases (DATABASE isolation). "
+            "Supports ``{tenant_id}`` and ``{database_name}`` placeholders."
+        ),
     )
 
-    #######################
-    # Cache Configuration #
-    #######################
+    # ------------------------------------------------------------------
+    # Cache / Redis
+    # ------------------------------------------------------------------
 
     redis_url: str | None = Field(
         default=None,
-        description="Redis connection URL for caching (optional)",
+        description="Redis connection URL.  Required when cache_enabled=True.",
     )
 
     cache_ttl: int = Field(
         default=3600,
         ge=0,
-        description="Default cache TTL in seconds",
+        description="Default time-to-live for cached tenant objects (seconds).",
     )
 
     cache_enabled: bool = Field(
-        default=False,  # Requires redis_url — off by default to avoid runtime errors
-        description="Enable caching layer (requires redis_url)",
+        default=False,
+        description="Enable the Redis write-through cache for tenant lookups.",
     )
 
-    ################################
-    # Resolution Strategy Settings #
-    ################################
+    # ------------------------------------------------------------------
+    # Resolution strategy parameters
+    # ------------------------------------------------------------------
 
     tenant_header_name: str = Field(
         default="X-Tenant-ID",
-        description="Header name for tenant resolution (HEADER strategy)",
+        description="HTTP header name read by the HEADER resolution strategy.",
     )
 
     domain_suffix: str | None = Field(
         default=None,
-        description="Domain suffix for subdomain resolution (e.g., '.example.com')",
+        description=(
+            "Base domain suffix for SUBDOMAIN resolution "
+            "(e.g. ``'.example.com'``)."
+        ),
     )
 
     path_prefix: str = Field(
         default="/tenants",
-        description="Path prefix for path-based resolution",
+        description="URL path prefix for PATH resolution (e.g. ``'/tenants'``).",
     )
 
     jwt_secret: str | None = Field(
         default=None,
-        description="Secret key for JWT validation (required for JWT strategy)",
+        description="Secret key for JWT verification.  Required for JWT resolution.",
     )
 
     jwt_algorithm: str = Field(
         default="HS256",
-        description="JWT signing algorithm",
+        description="JWT signing algorithm (e.g. ``'HS256'``, ``'RS256'``).",
     )
 
     jwt_tenant_claim: str = Field(
         default="tenant_id",
-        description="JWT claim containing tenant ID",
+        description="JWT payload claim that carries the tenant identifier.",
     )
 
-    #####################
-    # Security Settings #
-    #####################
+    # ------------------------------------------------------------------
+    # Security
+    # ------------------------------------------------------------------
 
     enable_rate_limiting: bool = Field(
         default=True,
-        description="Enable per-tenant rate limiting",
+        description="Enable per-tenant request rate limiting.",
     )
 
     rate_limit_per_minute: int = Field(
         default=100,
         ge=1,
-        le=10000,
-        description="Default rate limit per minute per tenant",
+        le=10_000,
+        description="Default request rate limit per tenant per minute.",
     )
 
     rate_limit_window: int = Field(
         default=60,
         ge=1,
-        description="Rate limit window in seconds",
+        description="Rate-limit window in seconds.",
     )
 
     enable_audit_logging: bool = Field(
         default=True,
-        description="Enable audit logging for tenant operations",
+        description="Record tenant operations in the audit log.",
     )
 
     enable_encryption: bool = Field(
         default=False,
-        description="Enable encryption for sensitive tenant data",
+        description="Encrypt sensitive tenant data at rest.",
     )
 
     encryption_key: str | None = Field(
         default=None,
-        description="Encryption key for data at rest (base64 encoded, 32 bytes)",
+        description=(
+            "Base64-encoded 32-byte encryption key.  Required when "
+            "enable_encryption=True."
+        ),
     )
 
-    #####################
-    # Tenant Management #
-    #####################
+    # ------------------------------------------------------------------
+    # Tenant management
+    # ------------------------------------------------------------------
 
     allow_tenant_registration: bool = Field(
         default=False,
-        description="Allow self-service tenant registration",
+        description="Allow self-service tenant registration via the API.",
     )
 
     max_tenants: int | None = Field(
         default=None,
         ge=1,
-        description="Maximum number of tenants allowed (None = unlimited)",
+        description="Hard cap on the number of tenants (None = unlimited).",
     )
 
     default_tenant_status: Literal["active", "suspended", "provisioning"] = Field(
         default="active",
-        description="Default status for new tenants",
+        description="Initial status assigned to newly created tenants.",
     )
 
-    ########################
-    # Performance Settings #
-    ########################
+    # ------------------------------------------------------------------
+    # Performance
+    # ------------------------------------------------------------------
 
     enable_query_logging: bool = Field(
         default=False,
-        description="Enable slow query logging",
+        description="Log slow database queries.",
     )
 
     slow_query_threshold_ms: int = Field(
         default=1000,
         ge=0,
-        description="Threshold for slow query logging in milliseconds",
+        description="Query duration threshold for slow-query logging (ms).",
     )
 
     enable_metrics: bool = Field(
         default=True,
-        description="Enable Prometheus metrics collection",
+        description="Expose tenant usage metrics.",
     )
 
-    ############################################################
-    # Hybrid Strategy Settings (for HYBRID isolation strategy) #
-    ############################################################
+    # ------------------------------------------------------------------
+    # Hybrid strategy
+    # ------------------------------------------------------------------
 
     premium_tenants: list[str] = Field(
         default_factory=list,
-        description="List of premium tenant IDs that get dedicated resources",
+        description="Tenant IDs that receive premium isolation treatment in HYBRID mode.",
     )
 
     premium_isolation_strategy: IsolationStrategy = Field(
         default=IsolationStrategy.SCHEMA,
-        description="Isolation strategy for premium tenants",
+        description="Isolation strategy applied to premium tenants in HYBRID mode.",
     )
 
     standard_isolation_strategy: IsolationStrategy = Field(
         default=IsolationStrategy.RLS,
-        description="Isolation strategy for standard tenants",
+        description="Isolation strategy applied to standard tenants in HYBRID mode.",
     )
 
-    #################################################
-    # Schema Naming (for SCHEMA isolation strategy) #
-    #################################################
+    # ------------------------------------------------------------------
+    # Schema naming
+    # ------------------------------------------------------------------
 
     schema_prefix: str = Field(
         default="tenant_",
-        description="Prefix for tenant schema names",
+        description="Prefix prepended to every tenant schema name.",
     )
 
     public_schema: str = Field(
         default="public",
-        description="Public/shared schema name",
+        description="Shared public schema name (PostgreSQL / MSSQL).",
     )
 
-    #################
-    # Feature Flags #
-    #################
+    # ------------------------------------------------------------------
+    # Feature flags
+    # ------------------------------------------------------------------
 
     enable_tenant_suspend: bool = Field(
         default=True,
-        description="Enable tenant suspension feature",
+        description="Allow tenants to be suspended via the management API.",
     )
 
     enable_soft_delete: bool = Field(
         default=True,
-        description="Enable soft delete for tenants",
+        description=(
+            "Mark tenants as DELETED instead of removing their rows from "
+            "the store (recommended for auditability)."
+        ),
     )
 
-    ##############
-    # Validators #
-    ##############
+    # ------------------------------------------------------------------
+    # Field validators
+    # ------------------------------------------------------------------
 
     @field_validator("database_url", mode="before")
     @classmethod
-    def validate_database_url(cls, v: str) -> str:
-        """Validate database URL and warn about sync drivers.
+    def _validate_database_url(cls, v: str) -> str:
+        """Normalise the database URL and warn when a sync driver is detected.
 
-        Accepts any SQLAlchemy-compatible URL.  Strips any trailing slash that
-        Pydantic v2's ``AnyUrl`` type used to append (Pydantic v2 normalises
-        URLs; using plain ``str`` avoids this but we guard defensively).
-        Emits a warning when a synchronous driver scheme is detected.
-
-        Args:
-            v: Database URL to validate
-
-        Returns:
-            Validated, normalised URL string
+        Strips any trailing slash that URL normalisation may append.
+        Emits a :class:`UserWarning` when the URL scheme uses a synchronous
+        driver (e.g. ``postgresql://`` instead of ``postgresql+asyncpg://``).
         """
         import warnings
 
         from fastapi_tenancy.utils.db_compat import detect_dialect
 
-        url_str = str(v).rstrip("/")
-        detect_dialect(url_str)
+        url = str(v).rstrip("/")
+        detect_dialect(url)  # validates the scheme is recognised
 
-        _SYNC_ONLY_SCHEMES = ("postgresql://", "sqlite://", "mysql://", "mssql://")
-        if any(url_str.startswith(s) for s in _SYNC_ONLY_SCHEMES):
+        _SYNC_SCHEMES = ("postgresql://", "sqlite://", "mysql://", "mssql://")
+        if any(url.startswith(s) for s in _SYNC_SCHEMES):
             warnings.warn(
-                "Database URL uses a synchronous driver scheme. "
-                "Use an async driver instead (e.g. postgresql+asyncpg, "
-                "sqlite+aiosqlite, mysql+aiomysql).",
+                f"database_url uses a synchronous driver scheme ({url.split('://')[0]}://). "
+                "Switch to an async driver — e.g. postgresql+asyncpg, "
+                "sqlite+aiosqlite, mysql+aiomysql.",
+                UserWarning,
                 stacklevel=4,
             )
-        return url_str
+        return url
 
     @field_validator("jwt_secret")
     @classmethod
-    def validate_jwt_secret(cls, v: str | None, info: ValidationInfo) -> str | None:
-        """Validate JWT secret is provided when using JWT resolution.
+    def _validate_jwt_secret(cls, v: str | None, info: ValidationInfo) -> str | None:
+        """Require a JWT secret when the JWT resolution strategy is active.
 
-        Args:
-            v: JWT secret value
-            info: Validation context
-
-        Returns:
-            Validated JWT secret
-
-        Raises:
-            ValueError: If JWT strategy requires secret
+        Also enforces a minimum length of 32 characters to prevent trivially
+        weak secrets from being accepted.
         """
         values = info.data
         if values.get("resolution_strategy") == ResolutionStrategy.JWT and not v:
-            raise ValueError("jwt_secret is required when using JWT resolution strategy")
-        if v and len(v) < 32:
-            raise ValueError("jwt_secret must be at least 32 characters long")
+            raise ValueError(
+                "jwt_secret is required when resolution_strategy is 'jwt'."
+            )
+        if v is not None and len(v) < 32:
+            raise ValueError("jwt_secret must be at least 32 characters long.")
         return v
 
     @field_validator("domain_suffix")
     @classmethod
-    def validate_domain_suffix(cls, v: str | None, info: ValidationInfo) -> str | None:
-        """Validate domain suffix is provided when using subdomain resolution.
-
-        Args:
-            v: Domain suffix value
-            info: Validation context
-
-        Returns:
-            Validated domain suffix
-
-        Raises:
-            ValueError: If subdomain strategy requires domain suffix
-        """
+    def _validate_domain_suffix(
+        cls, v: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Require domain_suffix when the SUBDOMAIN resolution strategy is active."""
         values = info.data
-        if values.get("resolution_strategy") == ResolutionStrategy.SUBDOMAIN and not v:
-            raise ValueError("domain_suffix is required when using subdomain resolution strategy")
+        if (
+            values.get("resolution_strategy") == ResolutionStrategy.SUBDOMAIN
+            and not v
+        ):
+            raise ValueError(
+                "domain_suffix is required when resolution_strategy is 'subdomain'."
+            )
         return v
 
     @field_validator("encryption_key")
     @classmethod
-    def validate_encryption_key(cls, v: str | None, info: ValidationInfo) -> str | None:
-        """Validate encryption key is provided when encryption is enabled.
-
-        Args:
-            v: Encryption key value
-            info: Validation context
-
-        Returns:
-            Validated encryption key
-
-        Raises:
-            ValueError: If encryption enabled but no key
-        """
+    def _validate_encryption_key(
+        cls, v: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Require an encryption key when data-at-rest encryption is enabled."""
         values = info.data
         if values.get("enable_encryption") and not v:
-            raise ValueError("encryption_key is required when encryption is enabled")
-        if v and len(v) < 32:
-            raise ValueError("encryption_key must be at least 32 characters (base64 encoded)")
+            raise ValueError(
+                "encryption_key is required when enable_encryption is True."
+            )
+        if v is not None and len(v) < 32:
+            raise ValueError(
+                "encryption_key must be at least 32 characters (base64-encoded 32 bytes)."
+            )
         return v
 
     @field_validator("schema_prefix")
     @classmethod
-    def validate_schema_prefix(cls, v: str) -> str:
-        """Validate schema prefix format.
+    def _validate_schema_prefix(cls, v: str) -> str:
+        """Ensure schema_prefix is a valid PostgreSQL identifier fragment."""
+        import re
 
-        Args:
-            v: Schema prefix value
-
-        Returns:
-            Validated schema prefix
-
-        Raises:
-            ValueError: If prefix format is invalid
-        """
         if not re.match(r"^[a-z][a-z0-9_]*$", v):
             raise ValueError(
-                "schema_prefix must start with letter and contain only lowercase letters, "
-                "numbers, and underscores"
+                "schema_prefix must start with a lowercase letter and contain only "
+                "lowercase letters, digits, and underscores."
             )
         return v
 
-    ##################
-    # Helper Methods #
-    ##################
+    # ------------------------------------------------------------------
+    # Post-init cross-field validation
+    # ------------------------------------------------------------------
 
-    def get_schema_name(self, tenant_id: str) -> str:
-        """Get schema name for a tenant.
+    def model_post_init(self, __context: object) -> None:
+        """Run cross-field consistency checks after model construction."""
+        self._validate_configuration()
+
+    def _validate_configuration(self) -> None:
+        """Raise :class:`ValueError` if the configuration is internally inconsistent.
+
+        Checks
+        ------
+        * ``cache_enabled`` requires ``redis_url``.
+        * ``HYBRID`` isolation requires distinct premium and standard strategies.
+        * ``DATABASE`` isolation requires ``database_url_template``.
+        """
+        if self.cache_enabled and not self.redis_url:
+            raise ValueError(
+                "cache_enabled=True requires redis_url to be set."
+            )
+
+        if self.isolation_strategy == IsolationStrategy.HYBRID:
+            if self.premium_isolation_strategy == self.standard_isolation_strategy:
+                raise ValueError(
+                    "HYBRID isolation requires different strategies for premium and "
+                    "standard tenants.  Set premium_isolation_strategy and "
+                    "standard_isolation_strategy to different values."
+                )
+
+        if self.isolation_strategy == IsolationStrategy.DATABASE:
+            if not self.database_url_template:
+                raise ValueError(
+                    "DATABASE isolation requires database_url_template to be set "
+                    "(e.g. 'postgresql+asyncpg://user:pass@host/{database_name}')."
+                )
+
+    # ------------------------------------------------------------------
+    # Helper methods
+    # ------------------------------------------------------------------
+
+    def get_schema_name(self, tenant_identifier: str) -> str:
+        """Compute the PostgreSQL schema name for *tenant_identifier*.
+
+        The identifier is validated against the tenant slug rules before
+        use to prevent SQL injection via schema names.
 
         Args:
-            tenant_id: Tenant identifier
+            tenant_identifier: The tenant's human-readable slug.
 
         Returns:
-            Schema name for the tenant (e.g., 'tenant_acme')
+            Schema name string (e.g. ``"tenant_acme_corp"``).
 
         Raises:
-            ValueError: If tenant_id is invalid
+            ValueError: When *tenant_identifier* is invalid.
 
-        Example:
-            ```python
-            schema = config.get_schema_name("acme-corp")
-            # Returns: "tenant_acme_corp"
-            ```
+        Example::
+
+            config.get_schema_name("acme-corp")  # → "tenant_acme_corp"
         """
-        # Validate tenant_id to prevent SQL injection
         from fastapi_tenancy.utils.validation import validate_tenant_identifier
 
-        if not validate_tenant_identifier(tenant_id):
-            raise ValueError(f"Invalid tenant identifier: {tenant_id}")
-
-        # Sanitize for schema name (replace hyphens with underscores)
-        sanitized = tenant_id.replace("-", "_").replace(".", "_")
-        return f"{self.schema_prefix}{sanitized}"
+        if not validate_tenant_identifier(tenant_identifier):
+            raise ValueError(
+                f"Invalid tenant identifier for schema name: {tenant_identifier!r}"
+            )
+        sanitised = tenant_identifier.replace("-", "_").replace(".", "_")
+        return f"{self.schema_prefix}{sanitised}"
 
     def get_database_url_for_tenant(self, tenant_id: str) -> str:
-        """Get database URL for a tenant (for DATABASE isolation strategy).
+        """Build the database URL for *tenant_id* in DATABASE isolation mode.
 
         Args:
-            tenant_id: Tenant identifier
+            tenant_id: The tenant's opaque unique ID.
 
         Returns:
-            Database URL for the tenant
-
-        Example:
-            ```python
-            url = config.get_database_url_for_tenant("acme-corp")
-            ```
+            A fully-qualified async database URL string.
         """
         if self.database_url_template:
-            # Sanitize tenant_id for database name
             db_name = tenant_id.replace("-", "_").replace(".", "_").lower()
             return self.database_url_template.format(
-                tenant_id=tenant_id, database_name=f"tenant_{db_name}_db"
+                tenant_id=tenant_id,
+                database_name=f"tenant_{db_name}_db",
             )
         return str(self.database_url)
 
     def is_premium_tenant(self, tenant_id: str) -> bool:
-        """Check if tenant is premium.
+        """Return ``True`` if *tenant_id* is in the premium-tenants list.
 
         Args:
-            tenant_id: Tenant identifier
+            tenant_id: Tenant ID to check.
 
         Returns:
-            True if tenant is in premium list
-
-        Example:
-            ```python
-            if config.is_premium_tenant("acme-corp"):
-                # Use premium isolation strategy
-            ```
+            ``True`` for premium tenants; ``False`` for standard tenants.
         """
         return tenant_id in self.premium_tenants
 
     def get_isolation_strategy_for_tenant(self, tenant_id: str) -> IsolationStrategy:
-        """Get isolation strategy for a specific tenant.
+        """Return the effective isolation strategy for *tenant_id*.
 
-        For HYBRID strategy, returns the appropriate strategy based on tenant tier.
-        For other strategies, returns the configured strategy.
+        In ``HYBRID`` mode this dispatches to
+        :attr:`premium_isolation_strategy` or :attr:`standard_isolation_strategy`
+        based on the tenant's tier.  In all other modes it returns
+        :attr:`isolation_strategy` unchanged.
 
         Args:
-            tenant_id: Tenant identifier
+            tenant_id: Tenant ID to evaluate.
 
         Returns:
-            Isolation strategy for the tenant
-
-        Example:
-            ```python
-            strategy = config.get_isolation_strategy_for_tenant("acme-corp")
-            # Returns: IsolationStrategy.SCHEMA (if premium)
-            # or IsolationStrategy.RLS (if standard)
-            ```
+            The :class:`~fastapi_tenancy.core.types.IsolationStrategy` to apply.
         """
         if self.isolation_strategy != IsolationStrategy.HYBRID:
             return self.isolation_strategy
-
         return (
             self.premium_isolation_strategy
             if self.is_premium_tenant(tenant_id)
             else self.standard_isolation_strategy
         )
-
-    def model_post_init(self, __context: object) -> None:
-        """Run cross-field validation after model construction.
-
-        Automatically calls :meth:`validate_configuration` so misconfigured
-        combinations (e.g. ``cache_enabled=True`` without a ``redis_url``) are
-        caught at construction time rather than at runtime.
-        """
-        self.validate_configuration()
-
-    def validate_configuration(self) -> None:
-        """Validate complete configuration consistency.
-
-        Raises:
-            ValueError: If configuration is inconsistent
-
-        Example:
-            ```python
-            config = TenancyConfig(...)
-            config.validate_configuration()  # Raises if invalid
-            ```
-        """
-        # Check cache configuration
-        if self.cache_enabled and not self.redis_url:
-            raise ValueError("cache_enabled requires redis_url to be set")
-
-        # Check hybrid strategy
-        if self.isolation_strategy == IsolationStrategy.HYBRID:  # noqa: SIM102
-            if self.premium_isolation_strategy == self.standard_isolation_strategy:
-                raise ValueError(
-                    "Hybrid strategy requires different isolation strategies "
-                    "for premium and standard tenants"
-                )
-
-        # Check database template for database isolation
-        if self.isolation_strategy == IsolationStrategy.DATABASE:  # noqa: SIM102
-            if not self.database_url_template:
-                raise ValueError("DATABASE isolation requires database_url_template")
 
 
 __all__ = ["TenancyConfig"]

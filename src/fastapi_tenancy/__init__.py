@@ -17,33 +17,44 @@ Quick start
 
 Public API
 ----------
-Core types
-    Tenant, TenantStatus, IsolationStrategy, ResolutionStrategy, TenantConfig
-
 Configuration
-    TenancyConfig
+    :class:`TenancyConfig`
+
+Core types
+    :class:`Tenant`, :class:`TenantStatus`, :class:`IsolationStrategy`,
+    :class:`ResolutionStrategy`, :class:`TenantConfig`, :class:`AuditLog`,
+    :class:`TenantMetrics`
 
 Manager & Middleware
-    TenancyManager, TenancyMiddleware
+    :class:`TenancyManager`, :class:`TenancyMiddleware`
 
 Context helpers
-    TenantContext, get_current_tenant, get_current_tenant_optional
+    :class:`TenantContext`, :func:`get_current_tenant`,
+    :func:`get_current_tenant_optional`
 
 FastAPI dependencies
-    get_tenant_db, require_active_tenant, get_tenant_config
+    :func:`get_tenant_db`, :func:`require_active_tenant`, :func:`get_tenant_config`
 
 Storage backends
-    TenantStore (ABC), InMemoryTenantStore, SQLAlchemyTenantStore
+    :class:`TenantStore`, :class:`InMemoryTenantStore`,
+    :class:`SQLAlchemyTenantStore`
 
-Cache
-    TenantCache
+Isolation providers
+    :class:`BaseIsolationProvider`
 
-Migrations
-    MigrationManager
+Resolution strategies
+    :class:`BaseTenantResolver`
+
+Optional — requires ``[redis]`` extra
+    :class:`TenantCache`, :class:`RedisTenantStore`
+
+Optional — requires ``[migrations]`` extra
+    :class:`MigrationManager`
 
 Exceptions
-    TenancyError and all its subclasses
+    :class:`TenancyError` and all its subclasses
 """
+
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError
@@ -51,7 +62,7 @@ from importlib.metadata import version as _pkg_version
 
 try:
     __version__: str = _pkg_version("fastapi-tenancy")
-except PackageNotFoundError:  # running from source without install
+except PackageNotFoundError:
     __version__ = "0.0.0+dev"
 
 __author__ = "fastapi-tenancy contributors"
@@ -81,63 +92,65 @@ from fastapi_tenancy.core.exceptions import (
     TenantQuotaExceededError,
     TenantResolutionError,
 )
+
+# Core types
 from fastapi_tenancy.core.types import (
     AuditLog,
-    BaseIsolationProvider,
     IsolationStrategy,
     ResolutionStrategy,
     Tenant,
     TenantConfig,
     TenantMetrics,
+    TenantResolver,
     TenantStatus,
 )
 
-# Dependencies
+# FastAPI dependencies
 from fastapi_tenancy.dependencies import (
     get_tenant_config,
     get_tenant_db,
     require_active_tenant,
 )
 
-# Manager
+# Manager & Middleware
 from fastapi_tenancy.manager import TenancyManager
-
-# Middleware
 from fastapi_tenancy.middleware.tenancy import TenancyMiddleware
 
-# Migrations (optional — requires: pip install fastapi-tenancy[migrations])
+# Storage
+from fastapi_tenancy.storage.database import SQLAlchemyTenantStore
+from fastapi_tenancy.storage.memory import InMemoryTenantStore
+from fastapi_tenancy.storage.tenant_store import TenantStore
+
+# Extension-point base classes
+from fastapi_tenancy.isolation.base import BaseIsolationProvider
+from fastapi_tenancy.resolution.base import BaseTenantResolver
+
+# Optional — requires: pip install fastapi-tenancy[redis]
+try:
+    from fastapi_tenancy.storage.redis import RedisTenantStore
+    from fastapi_tenancy.cache.tenant_cache import TenantCache
+except ImportError:
+    RedisTenantStore = None  # type: ignore[assignment, misc]
+    TenantCache = None  # type: ignore[assignment, misc]
+
+# Optional — requires: pip install fastapi-tenancy[migrations]
 try:
     from fastapi_tenancy.migrations.manager import MigrationManager
 except ImportError:
     MigrationManager = None  # type: ignore[assignment, misc]
 
-# Cache (optional — requires: pip install fastapi-tenancy[redis])
-try:
-    from fastapi_tenancy.cache.tenant_cache import TenantCache
-except ImportError:
-    TenantCache = None  # type: ignore[assignment, misc]
-from fastapi_tenancy.resolution.base import BaseTenantResolver
-from fastapi_tenancy.storage.memory import InMemoryTenantStore
-from fastapi_tenancy.storage.postgres import (
-    PostgreSQLTenantStore,
-    SQLAlchemyTenantStore,
-)
 
-# Storage
-from fastapi_tenancy.storage.tenant_store import TenantStore
-
-__all__ = [  # noqa: RUF022
+__all__ = [
     "__version__",
     # Types
     "Tenant",
     "TenantStatus",
     "TenantConfig",
     "TenantMetrics",
+    "TenantResolver",
     "AuditLog",
     "IsolationStrategy",
     "ResolutionStrategy",
-    "BaseTenantResolver",
-    "BaseIsolationProvider",
     # Config
     "TenancyConfig",
     # Context
@@ -167,10 +180,12 @@ __all__ = [  # noqa: RUF022
     # Storage
     "TenantStore",
     "InMemoryTenantStore",
-    "PostgreSQLTenantStore",
     "SQLAlchemyTenantStore",
-    # Cache
+    "RedisTenantStore",
+    # Extension points
+    "BaseIsolationProvider",
+    "BaseTenantResolver",
+    # Optional
     "TenantCache",
-    # Migrations
     "MigrationManager",
 ]

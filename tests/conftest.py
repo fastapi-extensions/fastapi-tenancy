@@ -1,206 +1,215 @@
-"""Shared pytest fixtures for fastapi-tenancy test suite.
+"""Root conftest.py — shared fixtures, helpers, and pytest configuration.
 
-Design philosophy
------------------
-- All fixtures that touch I/O use SQLite in-memory so the test suite runs
-  without any external services (PostgreSQL, Redis, etc.).
-- Fixtures are async where the SUT is async.
-- Scope is kept at "function" by default to guarantee full isolation.
-- Module-scoped fixtures are used only for expensive setup that is provably
-  read-only across tests (e.g., read-only config objects).
+Scope hierarchy used across the suite
+--------------------------------------
+* ``session``   — built once per pytest session (expensive engines, app instances)
+* ``module``    — built once per test module
+* ``function``  — built fresh for each test (default; safe for mutating stores)
+
+Async mode
+----------
+``asyncio_mode = "auto"`` in pyproject.toml means every ``async def test_*``
+is automatically treated as an async test.  No ``@pytest.mark.asyncio``
+needed anywhere.
+
+Available markers (declared in pyproject.toml)
+-----------------------------------------------
+* ``unit``        — pure Python, no I/O, sub-millisecond
+* ``integration`` — uses SQLite / mocks, no external services
+* ``e2e``         — full FastAPI TestClient / full request cycles
+* ``slow``        — > 1 second
 """
+
 from __future__ import annotations
 
-import asyncio
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fastapi_tenancy.core.context import TenantContext
-from fastapi_tenancy.core.types import Tenant, TenantStatus
-from fastapi_tenancy.storage.memory import InMemoryTenantStore
-
 # ---------------------------------------------------------------------------
-# Event loop — one per test session (required by pytest-asyncio)
+# Make the rewrite src importable regardless of cwd
 # ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def event_loop_policy():
-    return asyncio.DefaultEventLoopPolicy()
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
 # ---------------------------------------------------------------------------
-# Context isolation — always clear TenantContext between tests
+# Domain helpers
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def clear_tenant_context():
-    """Guarantee TenantContext is empty before and after every test."""
-    TenantContext.clear()
-    yield
-    TenantContext.clear()
+from fastapi_tenancy.core.types import (
+    IsolationStrategy,
+    ResolutionStrategy,
+    Tenant,
+    TenantStatus,
+)
 
 
-# ---------------------------------------------------------------------------
-# Tenant fixtures
-# ---------------------------------------------------------------------------
+def _now() -> datetime:
+    return datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
 
-@pytest.fixture
-def tenant_acme() -> Tenant:
+
+def build_tenant(
+    *,
+    id: str = "t-001",
+    identifier: str = "acme-corp",
+    name: str = "Acme Corporation",
+    status: TenantStatus = TenantStatus.ACTIVE,
+    metadata: dict[str, Any] | None = None,
+    isolation_strategy: IsolationStrategy | None = None,
+    database_url: str | None = None,
+    schema_name: str | None = None,
+) -> Tenant:
+    """Build a :class:`Tenant` with sensible defaults."""
     return Tenant(
-        id="acme-001",
-        identifier="acme-corp",
-        name="Acme Corp",
-        status=TenantStatus.ACTIVE,
-        metadata={"plan": "enterprise", "region": "us-east-1"},
-    )
-
-
-@pytest.fixture
-def tenant_widgets() -> Tenant:
-    return Tenant(
-        id="widgets-001",
-        identifier="widgets-inc",
-        name="Widgets Inc",
-        status=TenantStatus.ACTIVE,
-        metadata={"plan": "starter"},
-    )
-
-
-@pytest.fixture
-def tenant_suspended() -> Tenant:
-    return Tenant(
-        id="suspended-001",
-        identifier="suspended-corp",
-        name="Suspended Corp",
-        status=TenantStatus.SUSPENDED,
-    )
-
-
-@pytest.fixture
-def tenant_provisioning() -> Tenant:
-    return Tenant(
-        id="prov-001",
-        identifier="new-startup",
-        name="New Startup",
-        status=TenantStatus.PROVISIONING,
-    )
-
-
-@pytest.fixture
-def all_tenants(tenant_acme, tenant_widgets, tenant_suspended, tenant_provisioning):
-    return [tenant_acme, tenant_widgets, tenant_suspended, tenant_provisioning]
-
-
-# ---------------------------------------------------------------------------
-# Storage fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def memory_store() -> InMemoryTenantStore:
-    return InMemoryTenantStore()
-
-
-@pytest.fixture
-async def populated_store(
-    memory_store: InMemoryTenantStore,
-    tenant_acme: Tenant,
-    tenant_widgets: Tenant,
-    tenant_suspended: Tenant,
-) -> InMemoryTenantStore:
-    """In-memory store pre-populated with three tenants."""
-    await memory_store.create(tenant_acme)
-    await memory_store.create(tenant_widgets)
-    await memory_store.create(tenant_suspended)
-    return memory_store
-
-
-@pytest.fixture
-async def sqlite_store():
-    """SQLite-backed tenant store for integration tests."""
-    from fastapi_tenancy.storage.postgres import SQLAlchemyTenantStore
-
-    store = SQLAlchemyTenantStore(
-        database_url="sqlite+aiosqlite:///:memory:",
-        pool_size=1,
-    )
-    await store.initialize()
-    yield store
-    await store.close()
-
-
-# ---------------------------------------------------------------------------
-# Config fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def pg_config():
-    """TenancyConfig for PostgreSQL (for unit tests — engine not created)."""
-    from fastapi_tenancy.core.config import TenancyConfig
-    return TenancyConfig(
-        database_url="postgresql+asyncpg://user:pass@localhost/testdb",
-        resolution_strategy="header",
-        isolation_strategy="rls",
-    )
-
-
-@pytest.fixture
-def sqlite_config():
-    """TenancyConfig for SQLite — usable without a real DB."""
-    from fastapi_tenancy.core.config import TenancyConfig
-    return TenancyConfig(
-        database_url="sqlite+aiosqlite:///:memory:",
-        resolution_strategy="header",
-        isolation_strategy="schema",
+        id=id,
+        identifier=identifier,
+        name=name,
+        status=status,
+        metadata=metadata or {},
+        isolation_strategy=isolation_strategy,
+        database_url=database_url,
+        schema_name=schema_name,
+        created_at=_now(),
+        updated_at=_now(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Resolver fixtures
+# Tenant fixtures — one per status + extras
 # ---------------------------------------------------------------------------
-
-@pytest.fixture
-def header_resolver(populated_store: InMemoryTenantStore):
-    from fastapi_tenancy.resolution.header import HeaderTenantResolver
-    return HeaderTenantResolver(tenant_store=populated_store)
 
 
 @pytest.fixture
-def mock_resolver() -> MagicMock:
-    """Resolver that always succeeds — swap .resolve side_effect per test."""
-    r = MagicMock()
-    r.resolve = AsyncMock()
-    return r
-
-
-# ---------------------------------------------------------------------------
-# Middleware fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_app() -> MagicMock:
-    app = AsyncMock()
-    return app
+def t_active() -> Tenant:
+    return build_tenant()
 
 
 @pytest.fixture
-def middleware_with_resolver(mock_app, mock_resolver):
-    from fastapi_tenancy.middleware.tenancy import TenancyMiddleware
-    return TenancyMiddleware(app=mock_app, resolver=mock_resolver)
+def t_suspended() -> Tenant:
+    return build_tenant(id="t-002", identifier="suspended-co", status=TenantStatus.SUSPENDED)
+
+
+@pytest.fixture
+def t_deleted() -> Tenant:
+    return build_tenant(id="t-003", identifier="deleted-org", status=TenantStatus.DELETED)
+
+
+@pytest.fixture
+def t_provisioning() -> Tenant:
+    return build_tenant(id="t-004", identifier="new-startup", status=TenantStatus.PROVISIONING)
+
+
+@pytest.fixture
+def t_second() -> Tenant:
+    return build_tenant(id="t-005", identifier="globex-corp", name="Globex Corp")
+
+
+@pytest.fixture
+def t_with_meta() -> Tenant:
+    return build_tenant(
+        id="t-006",
+        identifier="meta-tenant",
+        metadata={"plan": "pro", "max_users": 100, "features_enabled": ["sso", "audit"]},
+    )
 
 
 # ---------------------------------------------------------------------------
-# Request helpers
+# InMemoryTenantStore fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def store():
+    """Empty InMemoryTenantStore, cleared after each test."""
+    from fastapi_tenancy.storage.memory import InMemoryTenantStore
+
+    s = InMemoryTenantStore()
+    yield s
+    s.clear()
+
+
+@pytest.fixture
+async def seeded_store(t_active, t_second):
+    """Store pre-populated with two active tenants."""
+    from fastapi_tenancy.storage.memory import InMemoryTenantStore
+
+    s = InMemoryTenantStore()
+    await s.create(t_active)
+    await s.create(t_second)
+    yield s
+    s.clear()
+
+
+# ---------------------------------------------------------------------------
+# SQLite / SQLAlchemy store
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def sqlite_store(tmp_path):
+    """SQLAlchemyTenantStore backed by a temp SQLite file."""
+    from fastapi_tenancy.storage.database import SQLAlchemyTenantStore
+
+    db_file = tmp_path / "test.db"
+    s = SQLAlchemyTenantStore(database_url=f"sqlite+aiosqlite:///{db_file}")
+    await s.initialize()
+    yield s
+    await s.close()
+
+
+# ---------------------------------------------------------------------------
+# Mock request builder
+# ---------------------------------------------------------------------------
+
 
 def make_request(
+    headers: dict[str, str] | None = None,
+    hostname: str = "acme-corp.example.com",
     path: str = "/api/data",
-    host: str = "localhost",
-    headers: dict | None = None,
+    method: str = "GET",
+    cookies: dict[str, str] | None = None,
 ) -> MagicMock:
+    """Return a lightweight mock of a Starlette Request."""
     req = MagicMock()
+    req.method = method
+    req.headers = dict(headers or {})
+    req.url.hostname = hostname
     req.url.path = path
-    req.url.hostname = host
-    req.headers = headers or {}
-    req.state = MagicMock()
+    req.cookies = cookies or {}
     return req
+
+
+# ---------------------------------------------------------------------------
+# Mock TenantStore
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_store(t_active):
+    """AsyncMock TenantStore that resolves to t_active."""
+    s = AsyncMock()
+    s.get_by_identifier.return_value = t_active
+    s.get_by_id.return_value = t_active
+    s.exists.return_value = True
+    return s
+
+
+# ---------------------------------------------------------------------------
+# TenancyConfig fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cfg():
+    """Minimal TenancyConfig using SQLite — no external services."""
+    from fastapi_tenancy.core.config import TenancyConfig
+
+    return TenancyConfig(
+        database_url="sqlite+aiosqlite:///:memory:",
+        resolution_strategy=ResolutionStrategy.HEADER,
+        isolation_strategy=IsolationStrategy.SCHEMA,
+    )

@@ -1,6 +1,26 @@
 """Path-based tenant resolution strategy.
 
-Resolves tenant from URL path (e.g., /tenants/{tenant-id}/resource).
+Extracts the tenant identifier from a fixed URL path prefix.
+
+URL scheme::
+
+    {path_prefix}/{tenant_identifier}/...
+
+Examples with default prefix ``/tenants``::
+
+    /tenants/acme-corp/users          → "acme-corp"
+    /tenants/widgets-inc/orders/123   → "widgets-inc"
+    /tenants/my-org/api/v2/items      → "my-org"
+
+Advantages
+----------
+* No DNS or TLS wildcard required — a single domain serves all tenants.
+* Works in environments that do not support custom subdomains.
+* Easy to route in API gateways and reverse proxies.
+
+Disadvantage
+------------
+* Tenant identifier is visible in every URL — ensure it is not sensitive.
 """
 
 from __future__ import annotations
@@ -21,19 +41,19 @@ logger = logging.getLogger(__name__)
 
 
 class PathTenantResolver(BaseTenantResolver):
-    """Resolve tenant from URL path.
+    """Resolve tenant from a fixed URL path prefix.
 
-    This resolver extracts the tenant identifier from a specific position
-    in the URL path.
+    Args:
+        path_prefix: Path segment that immediately precedes the tenant
+            identifier.  Trailing slashes are stripped automatically.
+            Defaults to ``"/tenants"``.
+        tenant_store: Storage backend for tenant lookup.
 
-    Example URLs:
-        /tenants/acme-corp/users → tenant: acme-corp
-        /tenants/widgets-inc/api/orders → tenant: widgets-inc
-        /api/tenants/tenant-123/dashboard → tenant: tenant-123
+    Example::
 
-    Attributes:
-        path_prefix: URL path prefix before tenant ID
-        tenant_store: Storage backend for tenant lookup
+        resolver = PathTenantResolver(path_prefix="/tenants", tenant_store=store)
+        # GET /tenants/acme-corp/users
+        tenant = await resolver.resolve(request)  # → Tenant(identifier="acme-corp")
     """
 
     def __init__(
@@ -41,47 +61,58 @@ class PathTenantResolver(BaseTenantResolver):
         path_prefix: str = "/tenants",
         tenant_store: TenantStore | None = None,
     ) -> None:
-        """Initialize path-based resolver.
-
-        Args:
-            path_prefix: URL path prefix before tenant ID
-            tenant_store: Optional tenant storage backend
-        """
         super().__init__(tenant_store)
-        self.path_prefix = path_prefix.rstrip("/")
-        logger.info("Initialized PathTenantResolver with prefix=%r", self.path_prefix)
+        self._prefix = path_prefix.rstrip("/")
+        logger.debug("PathTenantResolver prefix=%r", self._prefix)
 
     async def resolve(self, request: Request) -> Tenant:
-        """Resolve tenant from URL path."""
+        """Extract the tenant identifier from the request URL path.
+
+        Args:
+            request: Incoming FastAPI / Starlette request.
+
+        Returns:
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
+
+        Raises:
+            TenantResolutionError: When the path does not start with the
+                configured prefix, the prefix is not followed by a tenant
+                identifier, or the identifier has an invalid format.
+            TenantNotFoundError: When no tenant matches the extracted identifier.
+        """
         path = request.url.path
 
-        if not path.startswith(self.path_prefix):
+        if not path.startswith(self._prefix):
             raise TenantResolutionError(
-                reason=f"Path '{path}' does not start with prefix '{self.path_prefix}'",
+                reason="Request path does not start with the configured prefix.",
                 strategy="path",
-                details={"path": path, "expected_prefix": self.path_prefix},
+                details={"expected_prefix": self._prefix},
             )
 
-        # Extract tenant ID from path
-        path_parts = path[len(self.path_prefix) :].strip("/").split("/")
-
-        if not path_parts or not path_parts[0]:
+        remainder = path[len(self._prefix):].lstrip("/")
+        if not remainder:
             raise TenantResolutionError(
-                reason="No tenant ID found in path",
+                reason="No tenant identifier found after the path prefix.",
                 strategy="path",
-                details={"path": path},
+                details={"prefix": self._prefix},
             )
 
-        tenant_id = path_parts[0]
+        identifier = remainder.split("/")[0]
 
-        if not self.validate_tenant_identifier(tenant_id):
+        if not self.validate_tenant_identifier(identifier):
             raise TenantResolutionError(
-                reason=f"Invalid tenant identifier format in path: '{tenant_id}'",
+                reason="Path segment is not a valid tenant identifier.",
                 strategy="path",
-                details={"path": path, "tenant_id": tenant_id},
+                details={
+                    "hint": (
+                        "Must be 3-63 characters, start with a lowercase letter, "
+                        "and contain only lowercase letters, digits, and hyphens."
+                    )
+                },
             )
 
-        return await self.get_tenant_by_identifier(tenant_id)
+        logger.debug("Resolving tenant from path identifier=%r", identifier)
+        return await self.get_tenant_by_identifier(identifier)
 
 
 __all__ = ["PathTenantResolver"]

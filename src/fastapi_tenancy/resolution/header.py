@@ -1,8 +1,29 @@
 """Header-based tenant resolution strategy.
 
-Resolves tenant from HTTP header (default: X-Tenant-ID).
-This is the most common and straightforward resolution strategy.
+Extracts the tenant identifier from a named HTTP request header.
+
+This is the simplest and most widely applicable resolution strategy:
+
+* Works with every HTTP client without URL routing changes.
+* Trivial to test — just set a header in your test client.
+* Explicit: clients always know which tenant they are acting as.
+* Suitable for API clients, SDKs, mobile apps, and service-to-service calls.
+
+Example request::
+
+    GET /api/users HTTP/1.1
+    Host: api.example.com
+    X-Tenant-ID: acme-corp
+    Authorization: Bearer <token>
+
+Security note
+-------------
+Error responses from this resolver deliberately omit the full list of
+headers present in the request.  Leaking header names can expose
+internal infrastructure headers (``X-Forwarded-For``, auth tokens, etc.)
+to untrusted clients.  Only the *expected* header name is disclosed.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,51 +42,25 @@ logger = logging.getLogger(__name__)
 
 
 class HeaderTenantResolver(BaseTenantResolver):
-    """Resolve tenant from HTTP header.
+    """Resolve tenant from a named HTTP request header.
 
-    Extracts the tenant identifier from a specified HTTP header and looks up
-    the corresponding tenant in the store.  This is the simplest and most
-    common resolution strategy.
+    Header name matching is case-insensitive by default, consistent with
+    RFC 7230 §3.2 which specifies that HTTP/1.1 field names are
+    case-insensitive.
 
-    Advantages
-    ----------
-    * Simple to implement and test.
-    * Works with any HTTP client.
-    * No URL routing changes needed.
-    * Explicit tenant selection.
+    Args:
+        header_name: Name of the header to read.  Defaults to ``"X-Tenant-ID"``.
+        tenant_store: Storage backend for tenant lookup.
+        case_sensitive: When ``True``, the header name must match exactly.
+            Default ``False`` honours HTTP case-insensitivity.
 
-    Use cases
-    ---------
-    * API clients and SDKs.
-    * Mobile applications.
-    * Microservice-to-microservice communication.
-    * Development and CI environments.
-
-    Example request::
-
-        GET /api/users HTTP/1.1
-        Host: api.example.com
-        X-Tenant-ID: acme-corp
-        Authorization: Bearer token123
-
-    Example usage::
+    Example::
 
         resolver = HeaderTenantResolver(
             header_name="X-Tenant-ID",
             tenant_store=store,
         )
         tenant = await resolver.resolve(request)
-
-    Parameters
-    ----------
-    header_name:
-        Name of the HTTP header that carries the tenant identifier.
-    tenant_store:
-        Storage backend for tenant lookup.
-    case_sensitive:
-        When ``True``, the header name must match exactly.
-        When ``False`` (default), matching is case-insensitive —
-        standard HTTP/1.1 behaviour.
     """
 
     def __init__(
@@ -75,89 +70,71 @@ class HeaderTenantResolver(BaseTenantResolver):
         case_sensitive: bool = False,
     ) -> None:
         super().__init__(tenant_store)
-        self.header_name = header_name
-        self.case_sensitive = case_sensitive
-        logger.info(
+        self._header_name = header_name
+        self._case_sensitive = case_sensitive
+        logger.debug(
             "HeaderTenantResolver header=%r case_sensitive=%s",
             header_name,
             case_sensitive,
         )
 
     async def resolve(self, request: Request) -> Tenant:
-        """Resolve tenant from HTTP header.
+        """Extract the tenant identifier from the configured header and look it up.
 
-        Parameters
-        ----------
-        request:
-            Incoming FastAPI / Starlette request.
+        Args:
+            request: Incoming FastAPI / Starlette request.
 
-        Returns
-        -------
-        Tenant
-            The resolved tenant.
+        Returns:
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
 
-        Raises
-        ------
-        TenantResolutionError
-            If the header is absent, empty, or the identifier has an
-            invalid format.
-        TenantNotFoundError
-            If no tenant exists with the extracted identifier.
+        Raises:
+            TenantResolutionError: When the header is absent, empty, or the
+                identifier has an invalid format.
+            TenantNotFoundError: When no tenant matches the extracted identifier.
         """
-        tenant_id = self._get_header_value(request)
+        raw = self._extract_header(request)
 
-        if not tenant_id:
-            logger.warning("Header %r not found in request", self.header_name)
-            # Security: do NOT expose full header list
-            # Leaking all header names in an error response can reveal
-            # internal infrastructure headers (X-Forwarded-For, auth tokens,
-            # etc.) to untrusted clients.  Only expose the name that was
-            # expected — never the full header map.
+        if raw is None:
             raise TenantResolutionError(
-                reason="Required tenant header not found in request",
+                reason="Required tenant header is not present in the request.",
                 strategy="header",
-                details={"expected_header": self.header_name},
+                details={"expected_header": self._header_name},
             )
 
-        tenant_id = tenant_id.strip()
-
-        if not tenant_id:
-            logger.warning("Header %r is empty", self.header_name)
+        identifier = raw.strip()
+        if not identifier:
             raise TenantResolutionError(
-                reason="Tenant header is present but empty",
+                reason="Tenant header is present but contains an empty value.",
                 strategy="header",
-                details={"header_name": self.header_name},
+                details={"header_name": self._header_name},
             )
 
-        if not self.validate_tenant_identifier(tenant_id):
-            logger.warning("Invalid tenant identifier format: %r", tenant_id)
+        if not self.validate_tenant_identifier(identifier):
             raise TenantResolutionError(
-                reason="Invalid tenant identifier format",
+                reason="Tenant header value is not a valid tenant identifier.",
                 strategy="header",
                 details={
                     "hint": (
-                        "Identifier must be 3-63 characters, start with a letter, "
+                        "Must be 3-63 characters, start with a lowercase letter, "
                         "and contain only lowercase letters, digits, and hyphens."
-                    ),
+                    )
                 },
             )
 
-        logger.debug("Resolving tenant from header %r: %r", self.header_name, tenant_id)
-        return await self.get_tenant_by_identifier(tenant_id)
+        logger.debug(
+            "Resolving tenant from header %r identifier=%r",
+            self._header_name,
+            identifier,
+        )
+        return await self.get_tenant_by_identifier(identifier)
 
-    def _get_header_value(self, request: Request) -> str | None:
-        """Extract the header value from the request.
-
-        Handles both case-sensitive and case-insensitive matching.
-        HTTP headers are case-insensitive by spec (RFC 7230 §3.2); the
-        default ``case_sensitive=False`` honours that.
-        """
-        if self.case_sensitive:
-            return request.headers.get(self.header_name)
-
-        header_lower = self.header_name.lower()
-        for key, value in request.headers.items():
-            if key.lower() == header_lower:
+    def _extract_header(self, request: Request) -> str | None:
+        """Return the raw header value, or ``None`` if absent."""
+        if self._case_sensitive:
+            return request.headers.get(self._header_name)
+        target = self._header_name.lower()
+        for name, value in request.headers.items():
+            if name.lower() == target:
                 return value
         return None
 

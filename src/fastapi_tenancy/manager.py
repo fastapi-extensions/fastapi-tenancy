@@ -1,44 +1,31 @@
 """Central tenancy manager — lifecycle, middleware, and component orchestration.
 
+The :class:`TenancyManager` is the single entry-point for integrating
+fastapi-tenancy into a FastAPI application.  It:
+
+* Validates configuration at construction time (fast-fail, no I/O).
+* Lazily creates storage, resolver, and isolation components on first
+  ``initialize()`` call.
+* Provides :meth:`create_lifespan` — the recommended one-line integration
+  that registers middleware and handles the full lifecycle.
+
 Design decisions
 ----------------
-* ``TenancyManager.__init__`` accepts **no** ``app`` argument.  The FastAPI
-  application is only needed for two operations: registering middleware and
-  storing app-level state.  Both happen inside ``create_lifespan`` where the
-  real ``app`` instance is already available.  Removing ``app`` from
-  ``__init__`` makes the manager independently constructable and testable.
+* **No ``app`` argument in ``__init__``** — the manager is app-agnostic so
+  it can be constructed before the ``FastAPI`` instance and shared across
+  multiple apps in test scenarios.
 
-* **Middleware registration timing** — FastAPI (Starlette) raises a
-  ``RuntimeError`` if ``add_middleware`` is called after the application has
-  started (i.e. after the lifespan has begun).  ``TenancyMiddleware`` is
-  therefore registered *before* the lifespan's ``yield`` by calling
-  ``app.add_middleware`` inside the lifespan callable, which runs during the
-  ASGI startup phase — before the first request arrives but while middleware
-  stacking is still allowed.
+* **Middleware registration timing** — :meth:`create_lifespan` calls
+  ``app.add_middleware`` *inside* the lifespan callable, which runs during
+  the ASGI startup phase — before any request is processed but while
+  Starlette still allows middleware registration.  Calling ``add_middleware``
+  after startup raises ``RuntimeError("Cannot add middleware after an
+  application has started")``.
 
-  The correct pattern::
-
-      @asynccontextmanager
-      async def lifespan(app):
-          app.add_middleware(TenancyMiddleware, ...)  # ← BEFORE yield
-          await manager.initialize()
-          yield                                       # ← app now serving
-          await manager.shutdown()
-
-* **create_lifespan** is the recommended, one-call integration::
-
-      app = FastAPI(lifespan=TenancyManager.create_lifespan(config))
-
-Changes from v0.1.0
--------------------
-- ``app`` parameter removed from ``__init__`` (was only used for middleware
-  registration and app.state — both now happen inside ``create_lifespan``).
-- ``setup_middleware()`` is no longer a method on the manager.  Middleware is
-  wired automatically inside ``create_lifespan``.  Advanced users who need
-  manual wiring can call ``app.add_middleware(TenancyMiddleware, ...)``
-  *before* their lifespan yields.
-- ``lifespan()`` renamed to ``create_lifespan()`` (static factory method).
+* **Idempotent ``initialize``** — safe to call multiple times; only the
+  first call performs I/O.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,10 +34,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from fastapi_tenancy.core.context import TenantContext
-from fastapi_tenancy.core.types import (
-    Tenant,
-    TenantStatus,
-)
+from fastapi_tenancy.core.types import Tenant, TenantStatus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -71,17 +55,26 @@ class TenancyManager:
 
     The manager is **app-agnostic**: it holds configuration and references to
     storage, resolver, and isolation components without coupling to a specific
-    FastAPI application instance.  This makes it easy to test in isolation and
-    to share across multiple apps if needed.
+    FastAPI instance.  This makes it independently testable and reusable
+    across multiple apps.
 
     Lifecycle
     ---------
-    1. **Construct**: validates config, stores component references — no I/O.
-    2. **initialize()**: creates storage tables, isolation namespaces, default
-       tenants, etc.  All heavy I/O happens here.
-    3. **shutdown()**: disposes engines, closes Redis connections, etc.
+    1. **Construct** — validates config; stores overrides.  No I/O.
+    2. **initialize()** — creates database tables, initialises the resolver,
+       builds isolation structures.  All heavy I/O is here.
+    3. **shutdown()** — disposes engines, closes Redis connections.
 
-    The recommended integration uses :meth:`create_lifespan`::
+    Recommended integration::
+
+        from fastapi import FastAPI
+        from fastapi_tenancy import TenancyManager, TenancyConfig
+
+        config = TenancyConfig(
+            database_url="postgresql+asyncpg://user:pass@localhost/myapp",
+            resolution_strategy="header",
+            isolation_strategy="schema",
+        )
 
         app = FastAPI(lifespan=TenancyManager.create_lifespan(config))
 
@@ -91,10 +84,9 @@ class TenancyManager:
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            # Middleware MUST be registered before the lifespan yield.
-            # FastAPI/Starlette raises RuntimeError if add_middleware is
-            # called after startup has completed.
             from fastapi_tenancy.middleware.tenancy import TenancyMiddleware
+
+            # Middleware MUST be registered before the lifespan yields.
             app.add_middleware(TenancyMiddleware, manager=manager)
 
             await manager.initialize()
@@ -103,17 +95,15 @@ class TenancyManager:
 
         app = FastAPI(lifespan=lifespan)
 
-    Parameters
-    ----------
-    config:
-        Validated :class:`~fastapi_tenancy.core.config.TenancyConfig`.
-    tenant_store:
-        Override the default :class:`~fastapi_tenancy.storage.postgres.SQLAlchemyTenantStore`.
-        Useful for testing with :class:`~fastapi_tenancy.storage.memory.InMemoryTenantStore`.
-    resolver:
-        Override the resolver created from ``config.resolution_strategy``.
-    isolation_provider:
-        Override the isolation provider created from ``config.isolation_strategy``.
+    Args:
+        config: Validated :class:`~fastapi_tenancy.core.config.TenancyConfig`.
+        tenant_store: Override the default
+            :class:`~fastapi_tenancy.storage.database.SQLAlchemyTenantStore`.
+            Useful for testing with
+            :class:`~fastapi_tenancy.storage.memory.InMemoryTenantStore`.
+        resolver: Override the resolver built from ``config.resolution_strategy``.
+        isolation_provider: Override the isolation provider built from
+            ``config.isolation_strategy``.
     """
 
     def __init__(
@@ -126,16 +116,11 @@ class TenancyManager:
     ) -> None:
         self.config = config
         self._initialized = False
-
-        # Validate config before touching any I/O
-        self._validate_config()
-
-        # Store overrides — actual objects are created lazily in initialize()
         self._custom_store = tenant_store
         self._custom_resolver = resolver
         self._custom_isolation = isolation_provider
 
-        # These are set during initialize()
+        # Set during initialize()
         self.tenant_store: TenantStore
         self.resolver: BaseTenantResolver
         self.isolation_provider: BaseIsolationProvider
@@ -146,41 +131,36 @@ class TenancyManager:
             config.isolation_strategy.value,
         )
 
-    def _validate_config(self) -> None:
-        # Cross-field validation is handled by TenancyConfig.validate_configuration()
-        # which runs automatically at config construction time via model_post_init.
-        # No additional checks needed here.
-        pass
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Initialise all components (storage, resolver, isolation, defaults).
+        """Initialise all components.
 
-        Safe to call multiple times — subsequent calls are no-ops.
-        This method performs all I/O: creating database engines, running
-        schema creation, connecting to Redis, etc.
+        Idempotent — subsequent calls after the first are no-ops.  Performs
+        all I/O: creating database engines, storage tables, resolvers, and
+        isolation structures.
         """
         if self._initialized:
             return
 
         logger.info("TenancyManager initialising …")
 
-        self._initialize_storage()
-        self._initialize_resolver()
-        self._initialize_isolation()
+        self._init_storage()
+        self._init_resolver()
+        self._init_isolation()
 
         if hasattr(self.tenant_store, "initialize"):
             await self.tenant_store.initialize()
 
-        if hasattr(self.isolation_provider, "initialize"):
-            await self.isolation_provider.initialize()
-
-        await self._create_default_tenants()
+        await self._seed_default_tenants()
 
         self._initialized = True
         logger.info("TenancyManager initialised")
 
     async def shutdown(self) -> None:
-        """Release all resources (connection pools, Redis connections …)."""
+        """Release all resources — connection pools, Redis connections, etc."""
         if not self._initialized:
             return
 
@@ -203,6 +183,10 @@ class TenancyManager:
     async def __aexit__(self, *_: Any) -> None:
         await self.shutdown()
 
+    # ------------------------------------------------------------------
+    # create_lifespan — recommended integration
+    # ------------------------------------------------------------------
+
     @staticmethod
     def create_lifespan(
         config: TenancyConfig,
@@ -213,47 +197,44 @@ class TenancyManager:
         skip_paths: list[str] | None = None,
         debug_headers: bool = False,
     ) -> Lifespan[FastAPI]:
-        """Build a FastAPI ``lifespan`` context manager that manages a
-        :class:`TenancyManager`.
+        """Build a FastAPI ``lifespan`` context manager for the tenancy stack.
 
-        This is the **recommended** integration pattern::
-
-            from fastapi import FastAPI
-            from fastapi_tenancy import TenancyManager, TenancyConfig
-
-            config = TenancyConfig(
-                database_url="postgresql+asyncpg://...",
-                resolution_strategy="header",
-                isolation_strategy="schema",
-            )
-
-            app = FastAPI(lifespan=TenancyManager.create_lifespan(config))
+        This is the **recommended** integration pattern.  Pass the return
+        value directly to ``FastAPI(lifespan=...)``.
 
         The lifespan callable:
 
         1. Creates the :class:`TenancyManager`.
         2. Registers :class:`~fastapi_tenancy.middleware.tenancy.TenancyMiddleware`
-           on the *real* app **before** yielding — the only point at which
-           FastAPI/Starlette allows middleware registration.
+           on the real ``app`` **before** yielding (the only safe window).
         3. Calls ``manager.initialize()`` to perform all I/O setup.
-        4. Yields (application serves requests).
+        4. Yields — the application serves requests.
         5. Calls ``manager.shutdown()`` on teardown.
 
-        Parameters
-        ----------
-        config:
-            Validated tenancy configuration.
-        tenant_store:
-            Optional custom storage backend (defaults to PostgreSQL).
-        resolver:
-            Optional custom resolver (defaults to strategy from config).
-        isolation_provider:
-            Optional custom isolation provider.
-        skip_paths:
-            URL prefixes that bypass tenant resolution (health checks, docs).
-        debug_headers:
-            When ``True``, adds ``X-Tenant-ID`` / ``X-Tenant-Identifier``
-            response headers — useful during development.
+        Args:
+            config: Validated tenancy configuration.
+            tenant_store: Optional custom storage backend.
+            resolver: Optional custom resolver.
+            isolation_provider: Optional custom isolation provider.
+            skip_paths: URL prefixes that bypass tenant resolution.
+            debug_headers: When ``True``, add ``X-Tenant-*`` response headers.
+
+        Returns:
+            An ``asynccontextmanager``-wrapped lifespan callable for FastAPI.
+
+        Example::
+
+            from fastapi import FastAPI
+            from fastapi_tenancy import TenancyManager, TenancyConfig
+
+            config = TenancyConfig(
+                database_url="postgresql+asyncpg://user:pass@localhost/myapp",
+                resolution_strategy="subdomain",
+                isolation_strategy="schema",
+                domain_suffix=".example.com",
+            )
+
+            app = FastAPI(lifespan=TenancyManager.create_lifespan(config))
         """
         from fastapi_tenancy.middleware.tenancy import TenancyMiddleware
 
@@ -266,29 +247,33 @@ class TenancyManager:
                 isolation_provider=isolation_provider,
             )
 
-            # ── Middleware registration ────────────────────────────────────
-            # MUST happen before `yield`.  Starlette rebuilds the middleware
-            # stack on first request; calling add_middleware after the stack
-            # is built raises RuntimeError("Cannot add middleware after an
-            # application has started").  The lifespan callable runs during
-            # ASGI startup — after FastAPI is constructed but before it
-            # processes any requests — so this is the correct place.
+            # ──────────────────────────────────────────────────────────────
+            # Middleware registration — MUST happen before yield.
+            #
+            # Starlette rebuilds the middleware stack on the first request.
+            # Calling add_middleware after the stack is built raises:
+            #   RuntimeError("Cannot add middleware after an application has started")
+            #
+            # The lifespan callable is invoked during ASGI startup — after
+            # FastAPI is constructed but before any request is processed —
+            # making this the only correct registration window.
+            # ──────────────────────────────────────────────────────────────
             app.add_middleware(
                 TenancyMiddleware,
                 config=config,
-                manager=manager,   # resolver looked up via manager post-init
+                manager=manager,
                 skip_paths=skip_paths,
                 debug_headers=debug_headers,
             )
 
-            # ── Register app state so dependencies can access components ───
+            # Expose the manager on app.state so dependencies can access it.
             app.state.tenancy_manager = manager
             app.state.tenancy_config = config
 
-            # ── I/O initialisation ────────────────────────────────────────
+            # I/O initialisation (creates tables, engines, etc.)
             await manager.initialize()
 
-            # ── Expose post-init state ────────────────────────────────────
+            # Post-init state for dependency injection
             app.state.tenant_store = manager.tenant_store
             app.state.isolation_provider = manager.isolation_provider
 
@@ -299,54 +284,61 @@ class TenancyManager:
 
         return _lifespan
 
-    def _initialize_storage(self) -> None:
+    # ------------------------------------------------------------------
+    # Private initialisation helpers
+    # ------------------------------------------------------------------
+
+    def _init_storage(self) -> None:
         if self._custom_store is not None:
             self.tenant_store = self._custom_store
-        else:
-            from fastapi_tenancy.storage.postgres import SQLAlchemyTenantStore
-            self.tenant_store = SQLAlchemyTenantStore(
-                database_url=str(self.config.database_url),
-                pool_size=self.config.database_pool_size,
-                max_overflow=self.config.database_max_overflow,
-            )
+            return
+        from fastapi_tenancy.storage.database import SQLAlchemyTenantStore
 
-    def _initialize_resolver(self) -> None:
+        self.tenant_store = SQLAlchemyTenantStore(
+            database_url=str(self.config.database_url),
+            pool_size=self.config.database_pool_size,
+            max_overflow=self.config.database_max_overflow,
+        )
+
+    def _init_resolver(self) -> None:
         if self._custom_resolver is not None:
             self.resolver = self._custom_resolver
-        else:
-            from fastapi_tenancy.resolution.factory import ResolverFactory
-            self.resolver = ResolverFactory.create(
-                strategy=self.config.resolution_strategy,
-                config=self.config,
-                tenant_store=self.tenant_store,
-            )
+            return
+        from fastapi_tenancy.resolution.factory import ResolverFactory
 
-    def _initialize_isolation(self) -> None:
+        self.resolver = ResolverFactory.create(
+            strategy=self.config.resolution_strategy,
+            config=self.config,
+            tenant_store=self.tenant_store,
+        )
+
+    def _init_isolation(self) -> None:
         if self._custom_isolation is not None:
             self.isolation_provider = self._custom_isolation
-        else:
-            from fastapi_tenancy.isolation.factory import IsolationProviderFactory
-            self.isolation_provider = IsolationProviderFactory.create(
-                strategy=self.config.isolation_strategy,
-                config=self.config,
-            )
+            return
+        from fastapi_tenancy.isolation.factory import IsolationProviderFactory
 
-    async def _create_default_tenants(self) -> None:
-        """Seed a demo tenant when self-registration is enabled and no tenants exist.
+        self.isolation_provider = IsolationProviderFactory.create(
+            strategy=self.config.isolation_strategy,
+            config=self.config,
+        )
 
-        Does NOT call ``initialize_tenant`` — the caller is responsible for
-        running migrations / creating schemas.  This only creates the store
-        record so the system is not completely empty on first start.
+    async def _seed_default_tenants(self) -> None:
+        """Create a demo tenant record when self-registration is enabled and no tenants exist.
+
+        Only creates the store record — does **not** call
+        :meth:`~fastapi_tenancy.isolation.base.BaseIsolationProvider.initialize_tenant`.
+        The application is responsible for provisioning schemas / running migrations.
         """
         if not self.config.allow_tenant_registration:
             return
         try:
-            count = await self.tenant_store.count()
+            if await self.tenant_store.count() > 0:
+                return
         except Exception as exc:
             logger.warning("Could not count tenants during seed: %s", exc)
             return
-        if count > 0:
-            return
+
         demo = Tenant(
             id="demo-tenant-001",
             identifier="demo",
@@ -356,25 +348,39 @@ class TenancyManager:
         )
         try:
             await self.tenant_store.create(demo)
-            logger.info("Created default demo tenant (store record only — run migrations separately)")  # noqa: E501
+            logger.info("Created demo tenant record (run migrations to provision schema)")
         except Exception as exc:
             logger.warning("Could not create demo tenant: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Utility API
+    # ------------------------------------------------------------------
+
     @asynccontextmanager
     async def tenant_scope(self, tenant_id: str) -> AsyncIterator[Tenant]:
-        """Async context manager that sets tenant context for *tenant_id*.
+        """Context manager that activates a tenant scope for background tasks.
 
-        Useful in background tasks, workers, and management commands::
+        Args:
+            tenant_id: Opaque ID of the tenant to activate.
+
+        Yields:
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
+
+        Example::
 
             async with manager.tenant_scope("acme-corp-001") as tenant:
-                await process_tenant_data(tenant)
+                await do_background_work(tenant)
         """
         tenant = await self.tenant_store.get_by_id(tenant_id)
         async with TenantContext.scope(tenant):
             yield tenant
 
     async def health_check(self) -> dict[str, Any]:
-        """Return health information for all managed components."""
+        """Return a health summary for all managed components.
+
+        Returns:
+            Dict with ``status`` and per-component ``components`` details.
+        """
         health: dict[str, Any] = {"status": "healthy", "components": {}}
         try:
             count = await self.tenant_store.count()
@@ -391,7 +397,12 @@ class TenancyManager:
         return health
 
     async def get_metrics(self) -> dict[str, Any]:
-        """Return basic tenancy metrics, fetching all counts in parallel."""
+        """Return basic tenancy metrics fetched in parallel.
+
+        Returns:
+            Dict with ``total_tenants``, ``active_tenants``,
+            ``suspended_tenants``, strategy names, and ``initialized`` flag.
+        """
         total, active, suspended = await asyncio.gather(
             self.tenant_store.count(),
             self.tenant_store.count(status=TenantStatus.ACTIVE),

@@ -1,6 +1,26 @@
 """Subdomain-based tenant resolution strategy.
 
-Resolves tenant from subdomain (e.g., tenant.example.com).
+Extracts the tenant identifier from the leftmost subdomain component of the
+request ``Host`` header.
+
+Example mapping::
+
+    acme-corp.example.com     → "acme-corp"
+    widgets-inc.example.com   → "widgets-inc"
+    app.acme-corp.example.com → "acme-corp"  (rightmost before suffix)
+
+Requirements
+------------
+* Wildcard DNS record: ``*.example.com → <your server>``
+* A wildcard TLS certificate covering ``*.example.com``
+* :attr:`~fastapi_tenancy.core.config.TenancyConfig.domain_suffix` configured
+  to ``".example.com"``
+
+Advantages
+----------
+* Clean, branded per-tenant URLs.
+* Natural browser isolation (separate cookie jars per subdomain).
+* SEO-friendly.
 """
 
 from __future__ import annotations
@@ -21,48 +41,25 @@ logger = logging.getLogger(__name__)
 
 
 class SubdomainTenantResolver(BaseTenantResolver):
-    """Resolve tenant from subdomain.
+    """Resolve tenant from the subdomain component of the request hostname.
 
-    This resolver extracts the tenant identifier from the subdomain portion
-    of the request hostname.
+    Multi-level subdomains (``app.acme-corp.example.com``) are handled by
+    using the rightmost subdomain segment immediately before the configured
+    ``domain_suffix`` — so the result is ``"acme-corp"``.
 
-    Advantages:
-    - Clean, user-friendly URLs
-    - Natural tenant isolation
-    - SEO-friendly
-    - Easy branding per tenant
+    Args:
+        domain_suffix: Base domain suffix (e.g. ``".example.com"`` or
+            ``"example.com"`` — the leading dot is added automatically).
+        tenant_store: Storage backend for tenant lookup.
 
-    Requirements:
-    - Wildcard DNS (*.example.com → your-server)
-    - SSL certificate for wildcard domain
-    - Proper domain configuration
+    Example::
 
-    Example Requests:
-        ```
-        https://acme-corp.example.com/dashboard
-        → Tenant: acme-corp
-
-        https://widgets-inc.example.com/api/users
-        → Tenant: widgets-inc
-
-        https://app.tenant-123.example.com/
-        → Tenant: tenant-123
-        ```
-
-    Example Usage:
-        ```python
         resolver = SubdomainTenantResolver(
             domain_suffix=".example.com",
             tenant_store=store,
         )
-
-        # Resolve from request
-        tenant = await resolver.resolve(request)
-        ```
-
-    Attributes:
-        domain_suffix: Main domain suffix (e.g., '.example.com')
-        tenant_store: Storage backend for tenant lookup
+        # Request to https://acme-corp.example.com/api
+        tenant = await resolver.resolve(request)  # → Tenant(identifier="acme-corp")
     """
 
     def __init__(
@@ -70,123 +67,67 @@ class SubdomainTenantResolver(BaseTenantResolver):
         domain_suffix: str,
         tenant_store: TenantStore | None = None,
     ) -> None:
-        """Initialize subdomain-based resolver.
-
-        Args:
-            domain_suffix: Main domain suffix (e.g., '.example.com')
-            tenant_store: Optional tenant storage backend
-
-        Example:
-            ```python
-            # Standard usage
-            resolver = SubdomainTenantResolver(domain_suffix=".example.com")
-
-            # With custom domain
-            resolver = SubdomainTenantResolver(domain_suffix=".myapp.io")
-            ```
-        """
         super().__init__(tenant_store)
-
-        # Ensure domain suffix starts with dot
-        self.domain_suffix = domain_suffix.lower()
-        if not self.domain_suffix.startswith("."):
-            self.domain_suffix = f".{self.domain_suffix}"
-
-        logger.info("Initialized SubdomainTenantResolver with suffix=%r", self.domain_suffix)
+        suffix = domain_suffix.lower().strip()
+        self._domain_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+        logger.debug("SubdomainTenantResolver suffix=%r", self._domain_suffix)
 
     async def resolve(self, request: Request) -> Tenant:
-        """Resolve tenant from subdomain.
-
-        Extracts subdomain from hostname and looks up the tenant.
+        """Extract the tenant identifier from the request hostname subdomain.
 
         Args:
-            request: FastAPI request object
+            request: Incoming FastAPI / Starlette request.
 
         Returns:
-            Resolved tenant
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantResolutionError: If hostname doesn't match, no subdomain, or invalid format
-            TenantNotFoundError: If tenant does not exist
-
-        Example:
-            ```python
-            # Request to https://acme-corp.example.com/api/users
-            tenant = await resolver.resolve(request)
-            # Returns: Tenant(id="123", identifier="acme-corp", ...)
-            ```
+            TenantResolutionError: When the hostname is absent, does not match
+                the configured suffix, has no subdomain, or the extracted
+                identifier has an invalid format.
+            TenantNotFoundError: When no tenant matches the extracted identifier.
         """
-        # Get hostname
         host = request.url.hostname
         if not host:
-            logger.warning("No hostname in request")
             raise TenantResolutionError(
-                reason="No hostname in request",
+                reason="No hostname found in request.",
                 strategy="subdomain",
-                details={"url": str(request.url)},
             )
 
         host = host.lower()
-        logger.debug("Resolving tenant from hostname: %s", host)
 
-        # Verify domain suffix matches
-        if not host.endswith(self.domain_suffix):
-            logger.warning(
-                "Host %r does not match domain suffix %r",
-                host, self.domain_suffix,
-            )
+        if not host.endswith(self._domain_suffix):
             raise TenantResolutionError(
-                reason=f"Host '{host}' does not match domain suffix '{self.domain_suffix}'",
+                reason="Request hostname does not match the configured domain suffix.",
+                strategy="subdomain",
+                details={"expected_suffix": self._domain_suffix},
+            )
+
+        subdomain_part = host[: -len(self._domain_suffix)]
+        if not subdomain_part:
+            raise TenantResolutionError(
+                reason="No subdomain found — request is to the apex domain.",
+                strategy="subdomain",
+                details={"hint": "Use tenant.example.com, not example.com."},
+            )
+
+        # For multi-level subdomains (app.acme-corp), use the rightmost segment.
+        identifier = subdomain_part.rsplit(".", maxsplit=1)[-1]
+
+        if not self.validate_tenant_identifier(identifier):
+            raise TenantResolutionError(
+                reason="Subdomain is not a valid tenant identifier.",
                 strategy="subdomain",
                 details={
-                    "host": host,
-                    "expected_suffix": self.domain_suffix,
-                    "hint": "Ensure the request is made to a subdomain of the configured domain",
+                    "hint": (
+                        "Must be 3-63 characters, start with a lowercase letter, "
+                        "and contain only lowercase letters, digits, and hyphens."
+                    )
                 },
             )
 
-        # Extract subdomain
-        subdomain = host[: -len(self.domain_suffix)]
-
-        if not subdomain:
-            logger.warning("No subdomain found in hostname: %s", host)
-            raise TenantResolutionError(
-                reason="No subdomain found in hostname",
-                strategy="subdomain",
-                details={
-                    "host": host,
-                    "hint": "Request must be made to tenant.example.com, not example.com",
-                },
-            )
-
-        # Handle multi-level subdomains (use first part only)
-        # e.g., app.acme-corp.example.com → acme-corp
-        if "." in subdomain:
-            parts = subdomain.split(".")
-            tenant_id = parts[-1]  # Use rightmost part before domain
-            logger.debug(
-                "Multi-level subdomain detected: %s using tenant_id: %s",
-                subdomain, tenant_id,
-            )
-        else:
-            tenant_id = subdomain
-
-        # Validate format
-        if not self.validate_tenant_identifier(tenant_id):
-            logger.warning("Invalid tenant identifier format in subdomain: %r", tenant_id)
-            raise TenantResolutionError(
-                reason=f"Invalid tenant identifier format in subdomain: '{tenant_id}'",
-                strategy="subdomain",
-                details={
-                    "subdomain": subdomain,
-                    "tenant_id": tenant_id,
-                    "hint": "Subdomain must contain only lowercase letters, numbers, and hyphens",
-                },
-            )
-
-        # Lookup tenant
-        logger.debug("Resolving tenant from subdomain: %s", tenant_id)
-        return await self.get_tenant_by_identifier(tenant_id)
+        logger.debug("Resolving tenant from subdomain identifier=%r", identifier)
+        return await self.get_tenant_by_identifier(identifier)
 
 
 __all__ = ["SubdomainTenantResolver"]

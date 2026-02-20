@@ -1,16 +1,24 @@
 """Hybrid isolation provider — routes tenants to different strategies by tier.
 
-Fix from v0.1.0
----------------
-When both premium and standard strategies target the same database (the most
-common configuration: schema for premium, RLS for standard), the two providers
-used to create separate connection pools to the same server, doubling resource
-usage.
+The :class:`HybridIsolationProvider` enables a tiered SaaS model:
 
-The fix: a single ``AsyncEngine`` is created here and injected into both
-providers via ``engine=`` keyword arguments.  Providers that accept an
-``engine`` parameter use it instead of building their own.
+* **Premium tenants** — strong isolation (e.g. dedicated schema or database).
+* **Standard tenants** — cost-efficient shared isolation (e.g. RLS or schema).
+
+A single ``AsyncEngine`` is built here and injected into both sub-providers so
+they share the same connection pool, avoiding duplicate resource allocation
+when both strategies target the same database server.
+
+Configuration::
+
+    config = TenancyConfig(
+        isolation_strategy="hybrid",
+        premium_isolation_strategy="schema",  # dedicated schema per premium tenant
+        standard_isolation_strategy="rls",    # shared tables for standard tenants
+        premium_tenants=["acme-corp", "enterprise-org"],
+    )
 """
+
 from __future__ import annotations
 
 import logging
@@ -34,56 +42,77 @@ logger = logging.getLogger(__name__)
 
 
 class HybridIsolationProvider(BaseIsolationProvider):
-    """Route tenants to different isolation strategies based on their tier.
+    """Route tenant requests to the appropriate isolation strategy by tier.
 
-    Configuration example::
+    The routing decision is made by :meth:`_get_provider` based on whether
+    the tenant's ID appears in :attr:`~fastapi_tenancy.core.config.TenancyConfig.premium_tenants`.
+
+    The shared ``AsyncEngine`` is passed to sub-providers via their ``engine=``
+    constructor argument so there is always exactly one connection pool,
+    regardless of how many strategies are configured.
+
+    Args:
+        config: Tenancy configuration.  Must have
+            :attr:`~fastapi_tenancy.core.config.TenancyConfig.isolation_strategy`
+            set to ``"hybrid"`` with distinct
+            :attr:`~fastapi_tenancy.core.config.TenancyConfig.premium_isolation_strategy`
+            and
+            :attr:`~fastapi_tenancy.core.config.TenancyConfig.standard_isolation_strategy`
+            values.
+
+    Example::
 
         config = TenancyConfig(
+            database_url="postgresql+asyncpg://user:pass@localhost/myapp",
             isolation_strategy="hybrid",
-            premium_isolation_strategy="schema",   # schema per premium tenant
-            standard_isolation_strategy="rls",     # shared tables for standard
-            premium_tenants=["acme-corp", "widgets-inc"],
+            premium_isolation_strategy="schema",
+            standard_isolation_strategy="rls",
+            premium_tenants=["enterprise-org"],
         )
+        provider = HybridIsolationProvider(config)
 
-    The single shared ``AsyncEngine`` is reused across both sub-providers
-    when they target the same database (avoiding duplicate connection pools).
+        # Premium tenant → SchemaIsolationProvider
+        async with provider.get_session(enterprise_tenant) as session:
+            ...
+
+        # Standard tenant → RLSIsolationProvider
+        async with provider.get_session(standard_tenant) as session:
+            ...
     """
 
     def __init__(self, config: TenancyConfig) -> None:
         super().__init__(config)
 
-        # Build one engine for the shared database and pass it to both providers
-        # so they share the same connection pool.
-        from sqlalchemy.pool import StaticPool as _StaticPool
-
         from fastapi_tenancy.utils.db_compat import detect_dialect, requires_static_pool
 
-        _dialect = detect_dialect(str(config.database_url))
-        _kw: dict[str, Any] = {"echo": config.database_echo}
-        if requires_static_pool(_dialect):
-            # SQLite in-memory: must use StaticPool to share the connection
-            _kw["poolclass"] = _StaticPool
-            _kw["connect_args"] = {"check_same_thread": False}
+        dialect = detect_dialect(str(config.database_url))
+        kw: dict[str, Any] = {"echo": config.database_echo}
+
+        if requires_static_pool(dialect):
+            from sqlalchemy.pool import StaticPool
+
+            kw["poolclass"] = StaticPool
+            kw["connect_args"] = {"check_same_thread": False}
         else:
-            _kw["pool_size"] = config.database_pool_size
-            _kw["max_overflow"] = config.database_max_overflow
-            _kw["pool_timeout"] = config.database_pool_timeout
-            _kw["pool_recycle"] = config.database_pool_recycle
-            _kw["pool_pre_ping"] = True
+            kw["pool_size"] = config.database_pool_size
+            kw["max_overflow"] = config.database_max_overflow
+            kw["pool_timeout"] = config.database_pool_timeout
+            kw["pool_recycle"] = config.database_pool_recycle
+            kw["pool_pre_ping"] = True
 
         self._shared_engine: AsyncEngine = create_async_engine(
-            str(config.database_url), **_kw
+            str(config.database_url), **kw
         )
 
-        self.premium_provider = self._create_provider(
+        self._premium = self._create_provider(
             config.premium_isolation_strategy, self._shared_engine
         )
-        self.standard_provider = self._create_provider(
+        self._standard = self._create_provider(
             config.standard_isolation_strategy, self._shared_engine
         )
 
         logger.info(
-            "HybridIsolationProvider initialised premium=%s standard=%s",
+            "HybridIsolationProvider premium=%s standard=%s",
             config.premium_isolation_strategy.value,
             config.standard_isolation_strategy.value,
         )
@@ -91,53 +120,57 @@ class HybridIsolationProvider(BaseIsolationProvider):
     def _create_provider(
         self, strategy: IsolationStrategy, engine: AsyncEngine
     ) -> BaseIsolationProvider:
-        """Instantiate a sub-provider, passing the shared engine directly.
-
-        Providers that accept ``engine=`` use it instead of creating their own,
-        so there is exactly one connection pool regardless of how many strategies
-        share the same database.
-        """
+        """Instantiate a sub-provider that reuses *engine* (no duplicate pool)."""
         from fastapi_tenancy.isolation.database import DatabaseIsolationProvider
         from fastapi_tenancy.isolation.rls import RLSIsolationProvider
         from fastapi_tenancy.isolation.schema import SchemaIsolationProvider
 
         if strategy == IsolationStrategy.SCHEMA:
-            # Pass engine= so SchemaIsolationProvider skips its own pool creation
             return SchemaIsolationProvider(self.config, engine=engine)
-
         if strategy == IsolationStrategy.RLS:
-            # Pass engine= so RLSIsolationProvider skips its own pool creation
             return RLSIsolationProvider(self.config, engine=engine)
-
         if strategy == IsolationStrategy.DATABASE:
-            # DATABASE manages per-tenant engines itself; share the master/admin engine
             return DatabaseIsolationProvider(self.config, master_engine=engine)
-
         raise ValueError(
-            f"Unsupported isolation strategy for HybridIsolationProvider: {strategy}"
+            f"Unsupported isolation strategy for HybridIsolationProvider: {strategy!r}"
         )
 
     def _get_provider(self, tenant: Tenant) -> BaseIsolationProvider:
-        is_premium = self.config.is_premium_tenant(tenant.id)
-        return self.premium_provider if is_premium else self.standard_provider
+        """Return the appropriate sub-provider for *tenant*'s tier."""
+        return (
+            self._premium
+            if self.config.is_premium_tenant(tenant.id)
+            else self._standard
+        )
+
+    # ------------------------------------------------------------------
+    # Delegation
+    # ------------------------------------------------------------------
 
     @asynccontextmanager
     async def get_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
+        """Yield a session from the provider appropriate for *tenant*'s tier."""
         async with self._get_provider(tenant).get_session(tenant) as session:
             yield session
 
     async def apply_filters(self, query: Any, tenant: Tenant) -> Any:
+        """Delegate to the provider appropriate for *tenant*'s tier."""
         return await self._get_provider(tenant).apply_filters(query, tenant)
 
     async def initialize_tenant(self, tenant: Tenant) -> None:
+        """Delegate to the provider appropriate for *tenant*'s tier."""
         await self._get_provider(tenant).initialize_tenant(tenant)
 
     async def destroy_tenant(self, tenant: Tenant) -> None:
+        """Delegate to the provider appropriate for *tenant*'s tier."""
         await self._get_provider(tenant).destroy_tenant(tenant)
+
+    async def verify_isolation(self, tenant: Tenant) -> bool:
+        """Delegate to the provider appropriate for *tenant*'s tier."""
+        return await self._get_provider(tenant).verify_isolation(tenant)
 
     async def close(self) -> None:
         """Dispose the shared engine — automatically closes all sub-providers."""
-        logger.info("Closing HybridIsolationProvider shared engine")
         await self._shared_engine.dispose()
         logger.info("HybridIsolationProvider closed")
 

@@ -1,36 +1,57 @@
-"""Factory for creating isolation provider instances."""
+"""Factory for creating isolation provider instances from configuration."""
+
+from __future__ import annotations
 
 from fastapi_tenancy.core.config import TenancyConfig
+from fastapi_tenancy.core.exceptions import ConfigurationError
 from fastapi_tenancy.core.types import IsolationStrategy
 from fastapi_tenancy.isolation.base import BaseIsolationProvider
 
 
 class IsolationProviderFactory:
-    """Factory for creating data isolation provider instances."""
+    """Static factory that constructs an :class:`BaseIsolationProvider` from config.
+
+    Provider classes are imported lazily inside :meth:`create` to avoid
+    unnecessary top-level imports for strategies that are not in use.
+    """
 
     @staticmethod
     def create(
         strategy: IsolationStrategy,
         config: TenancyConfig,
     ) -> BaseIsolationProvider:
-        """Create isolation provider based on strategy."""
-        from fastapi_tenancy.isolation.database import DatabaseIsolationProvider
-        from fastapi_tenancy.isolation.hybrid import HybridIsolationProvider
-        from fastapi_tenancy.isolation.rls import RLSIsolationProvider
-        from fastapi_tenancy.isolation.schema import SchemaIsolationProvider
+        """Build an isolation provider for *strategy*.
 
-        providers = {
-            IsolationStrategy.SCHEMA: SchemaIsolationProvider,
-            IsolationStrategy.DATABASE: DatabaseIsolationProvider,
-            IsolationStrategy.RLS: RLSIsolationProvider,
-            IsolationStrategy.HYBRID: HybridIsolationProvider,
-        }
+        Args:
+            strategy: The desired :class:`~fastapi_tenancy.core.types.IsolationStrategy`.
+            config: Application-wide tenancy configuration.
 
-        provider_class = providers.get(strategy)
-        if not provider_class:
-            raise ValueError(f"Unsupported isolation strategy: {strategy}")
+        Returns:
+            A fully-initialised :class:`BaseIsolationProvider`.
 
-        return provider_class(config)
+        Raises:
+            ConfigurationError: When *strategy* is unrecognised.
+        """
+        if strategy == IsolationStrategy.SCHEMA:
+            from fastapi_tenancy.isolation.schema import SchemaIsolationProvider
+            return SchemaIsolationProvider(config)
+
+        if strategy == IsolationStrategy.DATABASE:
+            from fastapi_tenancy.isolation.database import DatabaseIsolationProvider
+            return DatabaseIsolationProvider(config)
+
+        if strategy == IsolationStrategy.RLS:
+            from fastapi_tenancy.isolation.rls import RLSIsolationProvider
+            return RLSIsolationProvider(config)
+
+        if strategy == IsolationStrategy.HYBRID:
+            from fastapi_tenancy.isolation.hybrid import HybridIsolationProvider
+            return HybridIsolationProvider(config)
+
+        raise ConfigurationError(
+            parameter="isolation_strategy",
+            reason=f"Unrecognised isolation strategy: {strategy!r}.",
+        )
 
 
 __all__ = ["IsolationProviderFactory"]

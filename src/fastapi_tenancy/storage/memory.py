@@ -1,7 +1,23 @@
 """In-memory tenant storage implementation for testing and development.
 
-WARNING: This implementation stores data in memory only. All data is lost
-when the process restarts. Use ONLY for testing and development.
+.. warning::
+    This store holds all data in Python dictionaries.  All tenant records are
+    **lost when the process exits**.  Use it only for unit tests, integration
+    tests, local development, and demo environments.
+
+    For production deployments use
+    :class:`~fastapi_tenancy.storage.database.SQLAlchemyTenantStore` optionally
+    wrapped in :class:`~fastapi_tenancy.storage.redis.RedisTenantStore`.
+
+Design notes
+------------
+* **No async I/O**: all operations complete synchronously, wrapped in
+  ``async def`` to satisfy the :class:`~fastapi_tenancy.storage.tenant_store.TenantStore`
+  interface.  This keeps tests fast and eliminates the need for a database fixture.
+* **O(1) lookups**: ``_tenants`` (id → Tenant) and ``_identifier_map``
+  (identifier → id) are plain dicts — constant-time reads.
+* **Sorted list**: :meth:`list` sorts in-memory by ``created_at`` descending
+  to mirror the SQLAlchemy store's ``ORDER BY created_at DESC`` behaviour.
 """
 
 from __future__ import annotations
@@ -11,444 +27,386 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi_tenancy.core.exceptions import TenantNotFoundError
+from fastapi_tenancy.core.types import Tenant, TenantStatus
 from fastapi_tenancy.storage.tenant_store import TenantStore
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from fastapi_tenancy.core.types import Tenant, TenantStatus
-
 logger = logging.getLogger(__name__)
 
 
 class InMemoryTenantStore(TenantStore):
-    """In-memory tenant storage for testing and development.
+    """In-memory tenant store for testing and local development.
 
-    This implementation stores all tenant data in memory using Python
-    dictionaries. It's fast and simple but NOT persistent.
+    All state lives in two Python dictionaries:
 
-    Use cases:
-    - Unit testing
-    - Integration testing
-    - Local development
-    - Demos and examples
+    * ``_tenants`` — maps ``tenant_id → Tenant``
+    * ``_identifier_map`` — maps ``identifier → tenant_id``
 
-    DO NOT USE IN PRODUCTION - all data is lost on restart!
+    Both indices are kept in sync by every mutating method so that
+    :meth:`get_by_id` and :meth:`get_by_identifier` are always O(1).
 
-    Example:
-        ```python
-        # Create store
+    Example — pytest fixture::
+
+        import pytest
+        from fastapi_tenancy.storage.memory import InMemoryTenantStore
+
+        @pytest.fixture
+        async def tenant_store():
+            store = InMemoryTenantStore()
+            yield store
+            store.clear()   # reset between tests
+
+    Example — seeded store::
+
         store = InMemoryTenantStore()
+        await store.create(Tenant(id="t1", identifier="acme", name="Acme"))
+        await store.create(Tenant(id="t2", identifier="globex", name="Globex"))
 
-        # Create test tenants
-        tenant1 = Tenant(id="1", identifier="test1", name="Test 1")
-        await store.create(tenant1)
-
-        tenant2 = Tenant(id="2", identifier="test2", name="Test 2")
-        await store.create(tenant2)
-
-        # Query
-        tenant = await store.get_by_id("1")
         tenants = await store.list()
-
-        # Cleanup (for testing)
-        store.clear()
-        ```
-
-    Attributes:
-        _tenants: Dictionary mapping tenant ID to Tenant
-        _identifier_map: Dictionary mapping identifier to tenant ID
+        assert len(tenants) == 2
     """
 
     def __init__(self) -> None:
-        """Initialize in-memory tenant store.
-
-        Example:
-            ```python
-            store = InMemoryTenantStore()
-            ```
-        """
+        """Initialise an empty in-memory store."""
         self._tenants: dict[str, Tenant] = {}
-        self._identifier_map: dict[str, str] = {}
-        logger.info("Initialized in-memory tenant store")
+        self._identifier_map: dict[str, str] = {}   # identifier → tenant_id
+        logger.debug("InMemoryTenantStore initialised")
+
+    # ------------------------------------------------------------------
+    # Read operations
+    # ------------------------------------------------------------------
 
     async def get_by_id(self, tenant_id: str) -> Tenant:
-        """Get tenant by ID.
+        """Return the tenant with *tenant_id* or raise :exc:`TenantNotFoundError`.
 
         Args:
-            tenant_id: Tenant ID
+            tenant_id: Opaque tenant primary key.
 
         Returns:
-            Tenant object
+            Matching :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
+            TenantNotFoundError: When *tenant_id* is not in the store.
         """
-        if tenant_id not in self._tenants:
-            logger.warning("Tenant not found: %s", tenant_id)
+        tenant = self._tenants.get(tenant_id)
+        if tenant is None:
             raise TenantNotFoundError(identifier=tenant_id)
-
-        logger.debug("Retrieved tenant: %s", tenant_id)
-        return self._tenants[tenant_id]
-
-    async def get_by_identifier(self, identifier: str) -> Tenant:
-        """Get tenant by identifier.
-
-        Args:
-            identifier: Tenant identifier
-
-        Returns:
-            Tenant object
-
-        Raises:
-            TenantNotFoundError: If tenant does not exist
-        """
-        if identifier not in self._identifier_map:
-            logger.warning("Tenant not found by identifier: %s", identifier)
-            raise TenantNotFoundError(identifier=identifier)
-
-        tenant_id = self._identifier_map[identifier]
-        return self._tenants[tenant_id]
-
-    async def create(self, tenant: Tenant) -> Tenant:
-        """Create a new tenant.
-
-        Args:
-            tenant: Tenant to create
-
-        Returns:
-            Created tenant
-
-        Raises:
-            ValueError: If tenant already exists
-        """
-        if tenant.id in self._tenants:
-            raise ValueError(f"Tenant with ID {tenant.id} already exists")
-
-        if tenant.identifier in self._identifier_map:
-            raise ValueError(
-                f"Tenant with identifier {tenant.identifier} already exists"
-            )
-
-        # Store tenant
-        self._tenants[tenant.id] = tenant
-        self._identifier_map[tenant.identifier] = tenant.id
-
-        logger.info("Created tenant: %s (%s)", tenant.id, tenant.identifier)
         return tenant
 
-    async def update(self, tenant: Tenant) -> Tenant:
-        """Update an existing tenant.
+    async def get_by_identifier(self, identifier: str) -> Tenant:
+        """Return the tenant with *identifier* or raise :exc:`TenantNotFoundError`.
 
         Args:
-            tenant: Tenant with updated values
+            identifier: Human-readable tenant slug.
 
         Returns:
-            Updated tenant
+            Matching :class:`~fastapi_tenancy.core.types.Tenant`.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
+            TenantNotFoundError: When no tenant with *identifier* exists.
         """
-        if tenant.id not in self._tenants:
-            raise TenantNotFoundError(identifier=tenant.id)
-
-        # Update identifier mapping if changed
-        old_tenant = self._tenants[tenant.id]
-        if old_tenant.identifier != tenant.identifier:
-            # Remove old mapping
-            del self._identifier_map[old_tenant.identifier]
-            # Add new mapping
-            self._identifier_map[tenant.identifier] = tenant.id
-
-        # Create updated tenant with new timestamp
-        updated_tenant = tenant.model_copy(
-            update={"updated_at": datetime.now(UTC)}
-        )
-        self._tenants[tenant.id] = updated_tenant
-
-        logger.info("Updated tenant: %s", tenant.id)
-        return updated_tenant
-
-    async def delete(self, tenant_id: str) -> None:
-        """Delete a tenant.
-
-        Args:
-            tenant_id: Tenant ID to delete
-
-        Raises:
-            TenantNotFoundError: If tenant does not exist
-        """
-        if tenant_id not in self._tenants:
-            raise TenantNotFoundError(identifier=tenant_id)
-
-        tenant = self._tenants[tenant_id]
-
-        # Remove from both mappings
-        del self._identifier_map[tenant.identifier]
-        del self._tenants[tenant_id]
-
-        logger.info("Deleted tenant: %s", tenant_id)
+        tenant_id = self._identifier_map.get(identifier)
+        if tenant_id is None:
+            raise TenantNotFoundError(identifier=identifier)
+        return self._tenants[tenant_id]
 
     async def list(
         self,
         skip: int = 0,
         limit: int = 100,
         status: TenantStatus | None = None,
-    ) -> list[Tenant]:
-        """List tenants with pagination.
+    ) -> Iterable[Tenant]:
+        """Return a page of tenants sorted by ``created_at`` descending.
 
         Args:
-            skip: Number to skip
-            limit: Maximum to return
-            status: Optional status filter
+            skip: Number of records to skip.
+            limit: Maximum number of records to return.
+            status: Optional status filter.
 
         Returns:
-            List of tenants
+            Filtered and paginated list of tenants.
         """
         tenants = list(self._tenants.values())
-
-        # Filter by status if provided
-        if status:
+        if status is not None:
             tenants = [t for t in tenants if t.status == status]
-
-        # Sort by created_at descending (newest first)
         tenants.sort(key=lambda t: t.created_at, reverse=True)
-
-        # Apply pagination
-        result = tenants[skip : skip + limit]
-
-        logger.debug("Listed %d tenants (skip=%d limit=%d total=%d)", len(result), skip, limit, len(self._tenants))  # noqa: E501
-        return result
+        return tenants[skip : skip + limit]
 
     async def count(self, status: TenantStatus | None = None) -> int:
-        """Count tenants.
+        """Return the number of stored tenants, optionally filtered by status.
 
         Args:
-            status: Optional status filter
+            status: Optional status filter.
 
         Returns:
-            Number of tenants
+            Non-negative integer count.
         """
         if status is None:
-            count = len(self._tenants)
-        else:
-            count = sum(1 for t in self._tenants.values() if t.status == status)
-
-        logger.debug("Counted %d tenants", count)
-        return count
+            return len(self._tenants)
+        return sum(1 for t in self._tenants.values() if t.status == status)
 
     async def exists(self, tenant_id: str) -> bool:
-        """Check if tenant exists.
+        """Return ``True`` when a tenant with *tenant_id* exists.
 
         Args:
-            tenant_id: Tenant ID
+            tenant_id: Opaque tenant primary key.
 
         Returns:
-            True if exists
+            Existence flag.
         """
-        exists = tenant_id in self._tenants
-        logger.debug("Tenant %s exists: %s", tenant_id, exists)
-        return exists
+        return tenant_id in self._tenants
 
-    async def set_status(self, tenant_id: str, status: TenantStatus) -> Tenant:
-        """Update tenant status.
+    async def get_by_ids(self, tenant_ids: Any) -> Iterable[Tenant]:
+        """Return all tenants whose IDs appear in *tenant_ids*.
+
+        IDs with no matching tenant are silently skipped.
 
         Args:
-            tenant_id: Tenant ID
-            status: New status
+            tenant_ids: Iterable of opaque tenant IDs.
 
         Returns:
-            Updated tenant
+            Found tenants in the order their IDs appeared.
+        """
+        return [self._tenants[tid] for tid in tenant_ids if tid in self._tenants]
+
+    # ------------------------------------------------------------------
+    # Write operations
+    # ------------------------------------------------------------------
+
+    async def create(self, tenant: Tenant) -> Tenant:
+        """Persist a new tenant in memory.
+
+        Args:
+            tenant: Fully-populated tenant object.
+
+        Returns:
+            The stored tenant (identical to the input; no server-side transforms).
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
+            ValueError: When ``id`` or ``identifier`` already exists.
+        """
+        if tenant.id in self._tenants:
+            raise ValueError(f"Tenant id={tenant.id!r} already exists.")
+        if tenant.identifier in self._identifier_map:
+            raise ValueError(f"Tenant identifier={tenant.identifier!r} already exists.")
+
+        self._tenants[tenant.id] = tenant
+        self._identifier_map[tenant.identifier] = tenant.id
+        logger.debug("Created tenant id=%s identifier=%s", tenant.id, tenant.identifier)
+        return tenant
+
+    async def update(self, tenant: Tenant) -> Tenant:
+        """Replace all mutable fields of an existing tenant.
+
+        If the identifier changes, the old identifier key is removed from
+        the index and the new one is added atomically.
+
+        Args:
+            tenant: Updated tenant object.  ``tenant.id`` must exist.
+
+        Returns:
+            Updated tenant with a refreshed ``updated_at`` timestamp.
+
+        Raises:
+            TenantNotFoundError: When ``tenant.id`` is not in the store.
+        """
+        old = self._tenants.get(tenant.id)
+        if old is None:
+            raise TenantNotFoundError(identifier=tenant.id)
+
+        if old.identifier != tenant.identifier:
+            del self._identifier_map[old.identifier]
+            self._identifier_map[tenant.identifier] = tenant.id
+
+        updated = tenant.model_copy(update={"updated_at": datetime.now(UTC)})
+        self._tenants[tenant.id] = updated
+        logger.debug("Updated tenant id=%s", tenant.id)
+        return updated
+
+    async def delete(self, tenant_id: str) -> None:
+        """Remove a tenant from both internal indices.
+
+        Args:
+            tenant_id: ID of the tenant to delete.
+
+        Raises:
+            TenantNotFoundError: When *tenant_id* is not in the store.
+        """
+        tenant = self._tenants.get(tenant_id)
+        if tenant is None:
+            raise TenantNotFoundError(identifier=tenant_id)
+
+        del self._identifier_map[tenant.identifier]
+        del self._tenants[tenant_id]
+        logger.debug("Deleted tenant id=%s", tenant_id)
+
+    async def set_status(self, tenant_id: str, status: TenantStatus) -> Tenant:
+        """Update the lifecycle status of a tenant.
+
+        Args:
+            tenant_id: ID of the tenant to update.
+            status: New status value.
+
+        Returns:
+            Updated tenant with a refreshed ``updated_at`` timestamp.
+
+        Raises:
+            TenantNotFoundError: When *tenant_id* is not in the store.
         """
         tenant = await self.get_by_id(tenant_id)
-
-        updated_tenant = tenant.model_copy(
-            update={
-                "status": status,
-                "updated_at": datetime.now(UTC),
-            }
+        updated = tenant.model_copy(
+            update={"status": status, "updated_at": datetime.now(UTC)}
         )
-
-        self._tenants[tenant_id] = updated_tenant
-
-        logger.info("Updated tenant %s status to %s", tenant_id, status.value)
-        return updated_tenant
+        self._tenants[tenant_id] = updated
+        logger.debug("Set tenant %s status → %s", tenant_id, status.value)
+        return updated
 
     async def update_metadata(
         self,
         tenant_id: str,
         metadata: dict[str, Any],
     ) -> Tenant:
-        """Update tenant metadata.
+        """Shallow-merge *metadata* into the tenant's metadata dictionary.
 
         Args:
-            tenant_id: Tenant ID
-            metadata: Metadata to merge
+            tenant_id: ID of the tenant to update.
+            metadata: Key-value pairs to merge.
 
         Returns:
-            Updated tenant
+            Updated tenant.
 
         Raises:
-            TenantNotFoundError: If tenant does not exist
+            TenantNotFoundError: When *tenant_id* is not in the store.
         """
         tenant = await self.get_by_id(tenant_id)
-
-        # Merge metadata
-        updated_metadata = {**tenant.metadata, **metadata}
-
-        updated_tenant = tenant.model_copy(
+        updated = tenant.model_copy(
             update={
-                "metadata": updated_metadata,
+                "metadata": {**tenant.metadata, **metadata},
                 "updated_at": datetime.now(UTC),
             }
         )
-
-        self._tenants[tenant_id] = updated_tenant
-
-        logger.info("Updated metadata for tenant: %s", tenant_id)
-        return updated_tenant
-
-    async def get_by_ids(self, tenant_ids: Iterable[str]) -> Iterable[Tenant]:
-        """Get multiple tenants by IDs (optimized batch operation).
-
-        Args:
-            tenant_ids: List of tenant IDs
-
-        Returns:
-            List of tenants (skips IDs that don't exist)
-        """
-        tenants = []
-        for tenant_id in tenant_ids:
-            if tenant_id in self._tenants:
-                tenants.append(self._tenants[tenant_id])
-
-        logger.debug("Retrieved %d tenants by IDs", len(tenants))
-        return tenants
-
-    async def search( # type: ignore
-        self,
-        query: str,
-        limit: int = 10,
-    ) -> Iterable[Tenant]:
-        """Search tenants by name or identifier.
-
-        Args:
-            query: Search query
-            limit: Maximum results
-
-        Returns:
-            List of matching tenants
-        """
-        query_lower = query.lower()
-        matches = [
-            t
-            for t in self._tenants.values()
-            if query_lower in t.identifier.lower() or query_lower in t.name.lower()
-        ]
-
-        # Sort by relevance (exact matches first)
-        matches.sort(
-            key=lambda t: (
-                t.identifier.lower() == query_lower,
-                t.identifier.lower().startswith(query_lower),
-                query_lower in t.name.lower(),
-            ),
-            reverse=True,
-        )
-
-        result = matches[:limit]
-        logger.debug("Search %r returned %d results", query, len(result))
-        return result
+        self._tenants[tenant_id] = updated
+        logger.debug("Updated metadata for tenant id=%s", tenant_id)
+        return updated
 
     async def bulk_update_status(
         self,
-        tenant_ids: Iterable[str],
+        tenant_ids: Any,
         status: TenantStatus,
     ) -> Iterable[Tenant]:
-        """Update status for multiple tenants (optimized batch operation).
+        """Update the status of multiple tenants in one pass.
+
+        Uses a single shared timestamp so all ``updated_at`` values are
+        identical across the batch.  IDs with no matching tenant are skipped.
 
         Args:
-            tenant_ids: List of tenant IDs
-            status: New status for all tenants
+            tenant_ids: Iterable of opaque tenant IDs.
+            status: New status applied to every matched tenant.
 
         Returns:
-            List of updated tenants
+            Updated tenants in the order their IDs appeared.
         """
-        updated = []
         timestamp = datetime.now(UTC)
-
-        for tenant_id in tenant_ids:
-            if tenant_id in self._tenants:
-                tenant = self._tenants[tenant_id]
-                updated_tenant = tenant.model_copy(
-                    update={
-                        "status": status,
-                        "updated_at": timestamp,
-                    }
+        updated: list[Tenant] = []
+        for tid in tenant_ids:
+            tenant = self._tenants.get(tid)
+            if tenant is not None:
+                result = tenant.model_copy(
+                    update={"status": status, "updated_at": timestamp}
                 )
-                self._tenants[tenant_id] = updated_tenant
-                updated.append(updated_tenant)
-
-        logger.info("Bulk updated %d tenants to status %s", len(updated), status.value)
+                self._tenants[tid] = result
+                updated.append(result)
+        logger.debug("Bulk updated %d tenants → %s", len(updated), status.value)
         return updated
 
+    async def search(
+        self,
+        query: str,
+        limit: int = 10,
+        _scan_limit: int = 100,
+    ) -> Iterable[Tenant]:
+        """Search tenants by name or identifier substring.
+
+        Results are ranked by relevance:
+
+        1. Exact identifier match.
+        2. Identifier starts with *query*.
+        3. Name contains *query*.
+        4. Identifier contains *query*.
+
+        Args:
+            query: Case-insensitive search string.
+            limit: Maximum number of results to return.
+            _scan_limit: Accepted for interface compatibility; all in-memory
+                records are always scanned.
+
+        Returns:
+            Matching tenants sorted by relevance, up to *limit* results.
+        """
+        q = query.lower()
+        matches = [
+            t
+            for t in self._tenants.values()
+            if q in t.identifier.lower() or q in t.name.lower()
+        ]
+        matches.sort(
+            key=lambda t: (
+                t.identifier.lower() == q,
+                t.identifier.lower().startswith(q),
+                q in t.name.lower(),
+            ),
+            reverse=True,
+        )
+        return matches[:limit]
+
+    # ------------------------------------------------------------------
+    # Test / debug helpers
+    # ------------------------------------------------------------------
+
     def clear(self) -> None:
-        """Clear all tenants (for testing).
+        """Remove all tenants from both internal indices.
 
-        This removes all tenants from memory. Use only in tests!
+        Use in test teardown / fixture cleanup to reset state between cases::
 
-        Example:
-            ```python
             @pytest.fixture
             async def store():
                 store = InMemoryTenantStore()
                 yield store
-                store.clear()  # Cleanup after test
-            ```
+                store.clear()
         """
         self._tenants.clear()
         self._identifier_map.clear()
-        logger.info("Cleared all tenants from memory")
+        logger.debug("InMemoryTenantStore cleared")
 
-    def get_all_tenants(self) -> dict[str, Tenant]:
-        """Get all tenants as dictionary (for testing/debugging).
-
-        Returns:
-            Dictionary mapping tenant ID to Tenant
-
-        Example:
-            ```python
-            all_tenants = store.get_all_tenants()
-            print(f"Total tenants: {len(all_tenants)}")
-            ```
-        """
-        return self._tenants.copy()
-
-    def get_statistics(self) -> dict[str, Any]:
-        """Get store statistics (for monitoring).
+    def get_all(self) -> dict[str, Tenant]:
+        """Return a shallow-copy snapshot of all stored tenants keyed by ID.
 
         Returns:
-            Dictionary with statistics
-
-        Example:
-            ```python
-            stats = store.get_statistics()
-            print(f"Total: {stats['total']}")
-            print(f"Active: {stats['by_status']['active']}")
-            ```
+            ``{tenant_id: Tenant}`` dict.  Mutating it does not affect
+            the store.
         """
-        by_status:dict[str, Any] = {}
+        return dict(self._tenants)
+
+    def statistics(self) -> dict[str, Any]:
+        """Return a summary of current store state for monitoring and debugging.
+
+        Returns:
+            Dictionary with keys:
+
+            * ``total`` — total number of stored tenants.
+            * ``by_status`` — count per status value.
+            * ``identifier_index_size`` — should always equal ``total``.
+        """
+        by_status: dict[str, int] = {}
         for tenant in self._tenants.values():
-            status = tenant.status.value
-            by_status[status] = by_status.get(status, 0) + 1
+            by_status[tenant.status.value] = by_status.get(tenant.status.value, 0) + 1
 
         return {
             "total": len(self._tenants),
             "by_status": by_status,
-            "identifiers_mapped": len(self._identifier_map),
+            "identifier_index_size": len(self._identifier_map),
         }
 
 

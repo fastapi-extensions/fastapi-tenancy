@@ -1,7 +1,22 @@
-"""Custom exceptions for FastAPI Tenancy.
+"""Custom exceptions for fastapi-tenancy.
 
-All exceptions inherit from TenancyError for easy catching and handling.
-Each exception includes detailed error information and context.
+All exceptions derive from :class:`TenancyError` so callers can catch the
+entire family with a single ``except TenancyError`` clause while still being
+able to handle individual sub-types for fine-grained error recovery.
+
+Exception hierarchy
+-------------------
+TenancyError
+├── TenantNotFoundError
+├── TenantResolutionError
+├── TenantInactiveError
+├── IsolationError
+├── ConfigurationError
+├── MigrationError
+├── RateLimitExceededError
+├── TenantDataLeakageError
+├── TenantQuotaExceededError
+└── DatabaseConnectionError
 """
 
 from __future__ import annotations
@@ -10,39 +25,48 @@ from typing import Any
 
 
 class TenancyError(Exception):
-    """Base exception for all tenancy errors.
+    """Base exception for all fastapi-tenancy errors.
 
-    All custom exceptions inherit from this class, making it easy to catch
-    all tenancy-related errors with a single except clause.
+    Every public exception in this library subclasses ``TenancyError``,
+    enabling callers to distinguish tenancy-specific failures from other
+    application exceptions.
 
     Attributes:
-        message: Human-readable error message
-        details: Additional error context as dictionary
+        message: Human-readable description of the error.
+        details: Supplementary key-value context (safe to log, never
+            contains raw secrets or full stack traces).
     """
 
-    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
-        """Initialize exception.
-
-        Args:
-            message: Error message
-            details: Additional error details
-        """
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.message = message
-        self.details = details or {}
+        self.details: dict[str, Any] = details or {}
         super().__init__(message)
 
     def __str__(self) -> str:
-        """String representation with details."""
         if self.details:
-            return f"{self.message} | Details: {self.details}"
+            return f"{self.message} | details={self.details}"
         return self.message
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(message={self.message!r})"
 
 
 class TenantNotFoundError(TenancyError):
-    """Raised when tenant cannot be found or resolved.
+    """Raised when a tenant cannot be located in the configured store.
 
-    This typically occurs when a tenant ID doesn't exist in the database
-    or when tenant resolution fails to find a matching tenant.
+    Typical causes:
+
+    * The identifier extracted from the request does not match any tenant.
+    * A tenant was deleted between resolution and usage.
+    * The store is empty (e.g. first run without seed data).
+
+    Attributes:
+        identifier: The identifier that was looked up (may be ``None``
+            when the context is ambiguous).
     """
 
     def __init__(
@@ -50,22 +74,25 @@ class TenantNotFoundError(TenancyError):
         identifier: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            identifier: Tenant identifier that was not found
-            details: Additional error details
-        """
-        message = f"Tenant not found: {identifier}" if identifier else "Tenant not found"
+        message = (
+            f"Tenant not found: {identifier!r}" if identifier else "Tenant not found"
+        )
         super().__init__(message, details)
         self.identifier = identifier
 
 
 class TenantResolutionError(TenancyError):
-    """Raised when tenant resolution fails.
+    """Raised when the configured strategy cannot extract a tenant from a request.
 
-    This occurs when the resolution strategy cannot extract or parse
-    tenant information from the request.
+    This is distinct from :class:`TenantNotFoundError`: resolution failure
+    means the request itself is malformed (missing header, bad JWT format,
+    wrong path prefix, etc.); not-found means the identifier was valid but
+    the tenant does not exist.
+
+    Attributes:
+        reason: A concise, operator-readable explanation of why resolution
+            failed.  **Never** include raw user input in this field.
+        strategy: The resolution strategy that was active (e.g. ``"header"``).
     """
 
     def __init__(
@@ -74,13 +101,6 @@ class TenantResolutionError(TenancyError):
         strategy: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            reason: Reason for resolution failure
-            strategy: Resolution strategy that failed
-            details: Additional error details
-        """
         message = f"Tenant resolution failed: {reason}"
         if strategy:
             message += f" (strategy: {strategy})"
@@ -90,9 +110,14 @@ class TenantResolutionError(TenancyError):
 
 
 class TenantInactiveError(TenancyError):
-    """Raised when tenant is inactive or suspended.
+    """Raised when a resolved tenant is not in the ``ACTIVE`` status.
 
-    This prevents inactive or suspended tenants from accessing the system.
+    This prevents suspended, deleted, or provisioning tenants from
+    accessing any resource behind the tenancy middleware.
+
+    Attributes:
+        tenant_id: Internal ID of the inactive tenant.
+        status: The tenant's current lifecycle status value.
     """
 
     def __init__(
@@ -101,24 +126,22 @@ class TenantInactiveError(TenancyError):
         status: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            tenant_id: ID of inactive tenant
-            status: Current tenant status
-            details: Additional error details
-        """
-        message = f"Tenant {tenant_id} is {status}"
-        super().__init__(message, details)
+        super().__init__(f"Tenant {tenant_id!r} is {status}", details)
         self.tenant_id = tenant_id
         self.status = status
 
 
 class IsolationError(TenancyError):
-    """Raised when data isolation fails.
+    """Raised when a data-isolation operation fails.
 
-    This is a critical error that indicates a problem with database
-    schema, connection, or query filtering.
+    Isolation errors are serious operational failures — they indicate that
+    the library cannot guarantee tenant data separation.  Operators should
+    treat these as high-severity alerts.
+
+    Attributes:
+        operation: The isolation operation that failed (e.g.
+            ``"get_session"``, ``"initialize_tenant"``).
+        tenant_id: The affected tenant's ID (``None`` when not applicable).
     """
 
     def __init__(
@@ -127,25 +150,25 @@ class IsolationError(TenancyError):
         tenant_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            operation: Operation that failed
-            tenant_id: Tenant ID involved in operation
-            details: Additional error details
-        """
         message = f"Isolation operation failed: {operation}"
         if tenant_id:
-            message += f" (tenant: {tenant_id})"
+            message += f" (tenant: {tenant_id!r})"
         super().__init__(message, details)
         self.operation = operation
         self.tenant_id = tenant_id
 
 
 class ConfigurationError(TenancyError):
-    """Raised when configuration is invalid.
+    """Raised when the :class:`~fastapi_tenancy.core.config.TenancyConfig`
+    contains an invalid or logically inconsistent value.
 
-    This helps identify configuration problems early during startup.
+    Configuration errors are raised at construction time so
+    misconfigured applications fail fast during startup rather than at
+    the first request.
+
+    Attributes:
+        parameter: The name of the invalid configuration field.
+        reason: Why the current value is invalid.
     """
 
     def __init__(
@@ -154,23 +177,19 @@ class ConfigurationError(TenancyError):
         reason: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            parameter: Configuration parameter that is invalid
-            reason: Reason for invalidity
-            details: Additional error details
-        """
-        message = f"Invalid configuration for '{parameter}': {reason}"
-        super().__init__(message, details)
+        super().__init__(f"Invalid configuration for {parameter!r}: {reason}", details)
         self.parameter = parameter
         self.reason = reason
 
 
 class MigrationError(TenancyError):
-    """Raised when tenant migration fails.
+    """Raised when an Alembic migration operation fails for a tenant.
 
-    This occurs during schema/database migrations for tenants.
+    Attributes:
+        tenant_id: The affected tenant's ID.
+        operation: The migration operation (e.g. ``"upgrade"``,
+            ``"downgrade"``, ``"create_revision"``).
+        reason: The underlying error description.
     """
 
     def __init__(
@@ -180,25 +199,23 @@ class MigrationError(TenancyError):
         reason: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            tenant_id: Tenant ID
-            operation: Migration operation
-            reason: Failure reason
-            details: Additional error details
-        """
-        message = f"Migration failed for tenant {tenant_id} during {operation}: {reason}"
-        super().__init__(message, details)
+        super().__init__(
+            f"Migration failed for tenant {tenant_id!r} during {operation!r}: {reason}",
+            details,
+        )
         self.tenant_id = tenant_id
         self.operation = operation
         self.reason = reason
 
 
 class RateLimitExceededError(TenancyError):
-    """Raised when tenant exceeds rate limit.
+    """Raised when a tenant exceeds its configured request rate limit.
 
-    This is used for per-tenant rate limiting.
+    Attributes:
+        tenant_id: The rate-limited tenant's ID.
+        limit: The threshold that was exceeded.
+        window: Human-readable description of the time window
+            (e.g. ``"60 seconds"``).
     """
 
     def __init__(
@@ -208,26 +225,27 @@ class RateLimitExceededError(TenancyError):
         window: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            tenant_id: Tenant ID
-            limit: Rate limit threshold
-            window: Time window (e.g., "1 minute")
-            details: Additional error details
-        """
-        message = f"Rate limit exceeded for tenant {tenant_id}: {limit} requests per {window}"
-        super().__init__(message, details)
+        super().__init__(
+            f"Rate limit exceeded for tenant {tenant_id!r}: "
+            f"{limit} requests per {window}",
+            details,
+        )
         self.tenant_id = tenant_id
         self.limit = limit
         self.window = window
 
 
 class TenantDataLeakageError(TenancyError):
-    """Raised when potential data leakage is detected.
+    """Raised when a potential cross-tenant data leakage is detected.
 
-    This is a CRITICAL security error that should trigger alerts and
-    immediate investigation.
+    This is a **critical security exception**.  Any occurrence should
+    trigger an immediate alert, halt the request, and trigger an
+    incident-response process.
+
+    Attributes:
+        operation: The operation during which leakage was detected.
+        expected_tenant: The tenant that *should* own the data.
+        actual_tenant: The tenant whose data was encountered instead.
     """
 
     def __init__(
@@ -237,28 +255,25 @@ class TenantDataLeakageError(TenancyError):
         actual_tenant: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            operation: Operation where leakage was detected
-            expected_tenant: Expected tenant ID
-            actual_tenant: Actual tenant ID found
-            details: Additional error details
-        """
-        message = (
-            f"SECURITY: Potential data leakage detected in {operation}. "
-            f"Expected tenant: {expected_tenant}, got: {actual_tenant}"
+        super().__init__(
+            f"SECURITY: potential data leakage in {operation!r} — "
+            f"expected tenant {expected_tenant!r}, got {actual_tenant!r}",
+            details,
         )
-        super().__init__(message, details)
         self.operation = operation
         self.expected_tenant = expected_tenant
         self.actual_tenant = actual_tenant
 
 
 class TenantQuotaExceededError(TenancyError):
-    """Raised when tenant exceeds quota.
+    """Raised when a tenant exceeds a resource quota.
 
-    This is used for enforcing per-tenant resource quotas.
+    Attributes:
+        tenant_id: The affected tenant's ID.
+        quota_type: The type of quota exceeded (e.g. ``"users"``,
+            ``"storage_gb"``).
+        current: Current usage level.
+        limit: The configured quota limit.
     """
 
     def __init__(
@@ -269,20 +284,11 @@ class TenantQuotaExceededError(TenancyError):
         limit: int | float,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            tenant_id: Tenant ID
-            quota_type: Type of quota exceeded
-            current: Current usage
-            limit: Quota limit
-            details: Additional error details
-        """
-        message = (
-            f"Quota exceeded for tenant {tenant_id}: "
-            f"{quota_type} usage {current} exceeds limit {limit}"
+        super().__init__(
+            f"Quota exceeded for tenant {tenant_id!r}: "
+            f"{quota_type} usage {current} exceeds limit {limit}",
+            details,
         )
-        super().__init__(message, details)
         self.tenant_id = tenant_id
         self.quota_type = quota_type
         self.current = current
@@ -290,9 +296,14 @@ class TenantQuotaExceededError(TenancyError):
 
 
 class DatabaseConnectionError(TenancyError):
-    """Raised when database connection fails for a tenant.
+    """Raised when the library cannot establish a database connection for a tenant.
 
-    This typically occurs with database-per-tenant isolation.
+    Most common in ``DATABASE`` isolation mode where each tenant has a
+    dedicated database that may be unavailable.
+
+    Attributes:
+        tenant_id: The affected tenant's ID.
+        reason: A concise description of the connection failure.
     """
 
     def __init__(
@@ -301,15 +312,10 @@ class DatabaseConnectionError(TenancyError):
         reason: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize exception.
-
-        Args:
-            tenant_id: Tenant ID
-            reason: Connection failure reason
-            details: Additional error details
-        """
-        message = f"Database connection failed for tenant {tenant_id}: {reason}"
-        super().__init__(message, details)
+        super().__init__(
+            f"Database connection failed for tenant {tenant_id!r}: {reason}",
+            details,
+        )
         self.tenant_id = tenant_id
         self.reason = reason
 

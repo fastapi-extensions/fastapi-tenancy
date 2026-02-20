@@ -1,20 +1,34 @@
 """Database-per-tenant isolation — multi-database compatible.
 
-PostgreSQL
-    CREATE DATABASE + per-connection engine pool.
-MySQL / MariaDB
-    CREATE DATABASE (SCHEMA synonym) — full support.
-SQLite
-    Per-tenant .db file at a configured path (sqlite:///./tenants/{slug}.db).
-    Falls back to :class:`SchemaIsolationProvider` prefix mode if in-memory.
-MSSQL / Other
-    Raises ``IsolationError`` with a clear message — these require manual setup.
+Each tenant owns a separate database (or ``.db`` file for SQLite).  This
+provides the strongest data isolation at the cost of the highest resource
+overhead (one connection pool per tenant).
+
+Dialect support
+---------------
++------------------+---------------------------------------------+
+| Dialect          | Mechanism                                   |
++==================+=============================================+
+| PostgreSQL       | ``CREATE DATABASE`` via master connection   |
++------------------+---------------------------------------------+
+| MySQL / MariaDB  | ``CREATE DATABASE`` (SCHEMA == DATABASE)    |
++------------------+---------------------------------------------+
+| SQLite           | Per-tenant ``.db`` file path               |
++------------------+---------------------------------------------+
+| MSSQL            | Raises :exc:`IsolationError` (manual setup)|
++------------------+---------------------------------------------+
+
+Concurrency safety
+------------------
+A single :class:`asyncio.Lock` guards engine creation so that two concurrent
+first-requests for the same new tenant cannot race and leak a second engine.
 
 Security
 --------
-Every database name is validated via ``assert_safe_database_name()`` before
-any DDL interpolation.
+Every database name is validated via :func:`assert_safe_database_name`
+before being interpolated into any DDL statement.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,36 +61,27 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseIsolationProvider(BaseIsolationProvider):
-    """Separate database per tenant — multi-database compatible.
+    """Separate database per tenant with automatic dialect-based provisioning.
 
-    PostgreSQL / MySQL
-    ~~~~~~~~~~~~~~~~~~
-    Creates a new database via DDL (``CREATE DATABASE``).  Uses a master engine
-    (pointing to the admin/default database) for DDL and per-tenant engines for
-    queries.
+    A single master engine connects to the admin/default database for DDL.
+    Per-tenant engines are created lazily on the first request and cached for
+    the lifetime of the application.
 
-    SQLite
-    ~~~~~~
-    Creates a per-tenant ``.db`` file by substituting the tenant slug into the
-    base URL (e.g., ``sqlite+aiosqlite:///./data/{slug}.db``).  Each tenant
-    gets an independent file-backed database.
+    Args:
+        config: Tenancy configuration.
+        master_engine: Optional pre-built master engine (used when this provider
+            is created by :class:`~fastapi_tenancy.isolation.hybrid.HybridIsolationProvider`
+            to share the underlying connection pool).
 
-    Example
-    -------
-    .. code-block:: python
+    Example::
 
-        # PostgreSQL — creates tenant_acme_corp_db database
         provider = DatabaseIsolationProvider(config)
         await provider.initialize_tenant(tenant, metadata=Base.metadata)
 
         async with provider.get_session(tenant) as session:
             result = await session.execute(select(Order))
 
-        # SQLite dev — creates ./data/acme_corp.db
-        config = TenancyConfig(
-            database_url="sqlite+aiosqlite:///./data/main.db",
-            isolation_strategy="database",
-        )
+        await provider.close()  # dispose all per-tenant engines
     """
 
     def __init__(
@@ -87,53 +92,43 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
         super().__init__(config)
         self.dialect = detect_dialect(str(config.database_url))
         self._engines: dict[str, AsyncEngine] = {}
-        # Prevents two concurrent requests for the same new tenant from
-        # each racing through _get_tenant_engine() and leaking an engine.
-        self._engines_lock: asyncio.Lock = asyncio.Lock()
+        self._lock: asyncio.Lock = asyncio.Lock()
 
         if master_engine is not None:
-            self._master_engine: AsyncEngine = master_engine
+            self._master = master_engine
         else:
-            kw: dict[str, Any] = {
-                "echo": config.database_echo,
-                "pool_pre_ping": not requires_static_pool(self.dialect),
-            }
+            kw: dict[str, Any] = {"echo": config.database_echo, "isolation_level": "AUTOCOMMIT"}
             if requires_static_pool(self.dialect):
                 kw["poolclass"] = StaticPool
                 kw["connect_args"] = {"check_same_thread": False}
+                kw.pop("isolation_level", None)
             else:
                 kw["pool_size"] = max(config.database_pool_size, 5)
                 kw["max_overflow"] = config.database_max_overflow
                 kw["pool_pre_ping"] = True
-            kw["isolation_level"] = "AUTOCOMMIT"  # required for CREATE DATABASE
+            self._master = create_async_engine(str(config.database_url), **kw)
 
-            self._master_engine = create_async_engine(str(config.database_url), **kw)
-
-        logger.info(
-            "DatabaseIsolationProvider dialect=%s", self.dialect.value
-        )
+        logger.info("DatabaseIsolationProvider dialect=%s", self.dialect.value)
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_database_name(self, tenant: Tenant) -> str:
+    def _database_name(self, tenant: Tenant) -> str:
         slug = sanitize_identifier(tenant.identifier)
         return f"tenant_{slug}_db"
 
-    def _build_tenant_url(self, tenant: Tenant) -> str:
-        """Build the connection URL for a tenant's dedicated database."""
-        base_url = str(self.config.database_url)
-        slug = sanitize_identifier(tenant.identifier)  # always compute first
-        db_name = self._get_database_name(tenant)
+    def _tenant_url(self, tenant: Tenant) -> str:
+        """Build the connection URL for *tenant*'s dedicated database."""
+        import re
+
+        base = str(self.config.database_url)
+        slug = sanitize_identifier(tenant.identifier)
+        db_name = self._database_name(tenant)
 
         if self.dialect == DbDialect.SQLITE:
-            # Replace the file name component, preserving the scheme and path prefix.
-            # sqlite+aiosqlite:///./data/main.db → sqlite+aiosqlite:///./data/acme_corp.db
-            parts = base_url.rsplit("/", 1)
-            if len(parts) == 2:
-                return f"{parts[0]}/{slug}.db"
-            return base_url
+            parts = base.rsplit("/", 1)
+            return f"{parts[0]}/{slug}.db" if len(parts) == 2 else base
 
         if self.config.database_url_template:
             return self.config.database_url_template.format(
@@ -141,24 +136,23 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
                 database_name=db_name,
             )
 
-        # PostgreSQL / MySQL: replace the database name at the end of the URL.
-        import re as _re
-        new_url = _re.sub(r"(/[^/?]*)(\?.*)?$", f"/{db_name}\\2", base_url)
-        return new_url
+        # Replace the database name segment at the end of the URL.
+        return re.sub(r"(/[^/?]*)(\?.*)?$", f"/{db_name}\\2", base)
 
-    async def _get_tenant_engine(self, tenant: Tenant) -> AsyncEngine:
-        # Fast path — engine already exists (no lock needed for read)
+    async def _get_engine(self, tenant: Tenant) -> AsyncEngine:
+        """Return (or lazily create) the per-tenant engine.
+
+        Double-checked locking prevents two coroutines from racing on the
+        first request for the same tenant.
+        """
         if tenant.id in self._engines:
             return self._engines[tenant.id]
 
-        # Slow path — first request for this tenant; acquire lock to prevent
-        # a race where two concurrent callers both create engines and one leaks.
-        async with self._engines_lock:
-            # Re-check after acquiring lock (another coroutine may have just created it)
-            if tenant.id in self._engines:
+        async with self._lock:
+            if tenant.id in self._engines:  # re-check after acquiring lock
                 return self._engines[tenant.id]
 
-            url = self._build_tenant_url(tenant)
+            url = self._tenant_url(tenant)
             kw: dict[str, Any] = {"echo": self.config.database_echo}
             if requires_static_pool(self.dialect):
                 kw["poolclass"] = StaticPool
@@ -171,7 +165,7 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
 
             engine = create_async_engine(url, **kw)
             self._engines[tenant.id] = engine
-            logger.debug("Created engine for tenant %s url=%s", tenant.id, url)
+            logger.debug("Created engine tenant=%s", tenant.id)
             return engine
 
     # ------------------------------------------------------------------
@@ -180,7 +174,18 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
 
     @asynccontextmanager
     async def get_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
-        engine = await self._get_tenant_engine(tenant)
+        """Yield a session connected to *tenant*'s dedicated database.
+
+        Args:
+            tenant: Currently active tenant.
+
+        Yields:
+            An :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
+
+        Raises:
+            IsolationError: When the session cannot be opened.
+        """
+        engine = await self._get_engine(tenant)
         async with AsyncSession(engine, expire_on_commit=False) as session:
             try:
                 yield session
@@ -193,11 +198,11 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
                 ) from exc
 
     async def apply_filters(self, query: Any, tenant: Tenant) -> Any:
-        """Database isolation — no query modification needed."""
+        """No filtering required — each tenant has a dedicated database."""
         return query
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Provisioning
     # ------------------------------------------------------------------
 
     async def initialize_tenant(
@@ -205,10 +210,18 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
         tenant: Tenant,
         metadata: MetaData | None = None,
     ) -> None:
-        """Create tenant database and optionally create tables."""
+        """Create *tenant*'s dedicated database and optionally create tables.
+
+        Args:
+            tenant: Target tenant.
+            metadata: Application :class:`~sqlalchemy.MetaData`.  When supplied,
+                ``create_all`` is executed in the newly created database.
+
+        Raises:
+            IsolationError: When database creation or table creation fails.
+        """
         if self.dialect == DbDialect.SQLITE:
-            # SQLite: just create tables — file is auto-created
-            engine = await self._get_tenant_engine(tenant)
+            engine = await self._get_engine(tenant)
             if metadata is not None:
                 async with engine.begin() as conn:
                     await conn.run_sync(metadata.create_all)
@@ -220,12 +233,14 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
                 operation="initialize_tenant",
                 tenant_id=tenant.id,
                 details={
-                    "reason": "DATABASE isolation on MSSQL requires manual database creation. "
-                    "Use SCHEMA isolation or create the database manually.",
+                    "reason": (
+                        "DATABASE isolation on MSSQL requires manual database creation. "
+                        "Use SCHEMA isolation or create the database manually."
+                    )
                 },
             )
 
-        db_name = self._get_database_name(tenant)
+        db_name = self._database_name(tenant)
         try:
             assert_safe_database_name(db_name, context=f"tenant id={tenant.id!r}")
         except ValueError as exc:
@@ -236,26 +251,28 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
             ) from exc
 
         try:
-            async with self._master_engine.connect() as conn:
+            async with self._master.connect() as conn:
                 if self.dialect == DbDialect.POSTGRESQL:
                     result = await conn.execute(
-                        text("SELECT 1 FROM pg_database WHERE datname = :dbname"),
-                        {"dbname": db_name},
+                        text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                        {"name": db_name},
                     )
                     if result.scalar() is not None:
-                        logger.warning("Database %r already exists", db_name)
-                        return
-                    await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
-
+                        logger.warning("Database %r already exists — skipping CREATE", db_name)
+                    else:
+                        await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+                        logger.info("Created database %r for tenant %s", db_name, tenant.id)
                 elif self.dialect == DbDialect.MYSQL:
                     await conn.execute(
-                        text(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")  # noqa: E501
+                        text(
+                            f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                        )
                     )
-
-                logger.info("Created database %r for tenant %s", db_name, tenant.id)
+                    logger.info("Created database %r for tenant %s", db_name, tenant.id)
 
             if metadata is not None:
-                engine = await self._get_tenant_engine(tenant)
+                engine = await self._get_engine(tenant)
                 async with engine.begin() as conn:
                     await conn.run_sync(metadata.create_all)
                 logger.info("Created tables in database %r", db_name)
@@ -263,7 +280,6 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
         except IsolationError:
             raise
         except Exception as exc:
-            logger.error("Failed to init tenant %s: %s", tenant.id, exc, exc_info=True)
             raise IsolationError(
                 operation="initialize_tenant",
                 tenant_id=tenant.id,
@@ -271,24 +287,31 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
             ) from exc
 
     async def destroy_tenant(self, tenant: Tenant) -> None:
-        """Drop tenant database.
+        """Drop *tenant*'s dedicated database.
 
         .. warning::
-            Permanently destroys all data.
+            Permanently destroys all tenant data.
+
+        Args:
+            tenant: The tenant to destroy.
+
+        Raises:
+            IsolationError: When the database cannot be dropped.
         """
         if self.dialect == DbDialect.SQLITE:
             import os
+
             engine = self._engines.pop(tenant.id, None)
             if engine:
                 await engine.dispose()
-            url = self._build_tenant_url(tenant)
-            db_path = url.split("///", 1)[-1].lstrip("./")
-            if db_path and os.path.exists(db_path):
-                os.remove(db_path)
-                logger.warning("Deleted SQLite file %s for tenant %s", db_path, tenant.id)
+            url = self._tenant_url(tenant)
+            path = url.split("///", 1)[-1].lstrip("./")
+            if path and os.path.exists(path):
+                os.remove(path)
+                logger.warning("Deleted SQLite file %s for tenant %s", path, tenant.id)
             return
 
-        db_name = self._get_database_name(tenant)
+        db_name = self._database_name(tenant)
         try:
             assert_safe_database_name(db_name, context=f"tenant id={tenant.id!r}")
         except ValueError as exc:
@@ -302,14 +325,15 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
             await self._engines.pop(tenant.id).dispose()
 
         try:
-            async with self._master_engine.connect() as conn:
+            async with self._master.connect() as conn:
                 if self.dialect == DbDialect.POSTGRESQL:
+                    # Terminate all active connections before dropping.
                     await conn.execute(
                         text(
                             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                            "WHERE datname = :dbname AND pid <> pg_backend_pid()"
+                            "WHERE datname = :name AND pid <> pg_backend_pid()"
                         ),
-                        {"dbname": db_name},
+                        {"name": db_name},
                     )
                     await conn.execute(text(f'DROP DATABASE IF EXISTS "{db_name}"'))
                 elif self.dialect == DbDialect.MYSQL:
@@ -325,43 +349,48 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
             ) from exc
 
     async def verify_isolation(self, tenant: Tenant) -> bool:
+        """Return ``True`` if *tenant*'s database exists and is reachable."""
         if self.dialect == DbDialect.SQLITE:
-            url = self._build_tenant_url(tenant)
             import os
+
+            url = self._tenant_url(tenant)
             path = url.split("///", 1)[-1].lstrip("./")
             return os.path.exists(path)
 
-        db_name = self._get_database_name(tenant)
+        db_name = self._database_name(tenant)
         try:
             assert_safe_database_name(db_name)
         except ValueError:
             return False
 
         try:
-            async with self._master_engine.connect() as conn:
+            async with self._master.connect() as conn:
                 if self.dialect == DbDialect.POSTGRESQL:
-                    result = await conn.execute(
-                        text("SELECT 1 FROM pg_database WHERE datname = :dbname"),
-                        {"dbname": db_name},
+                    r = await conn.execute(
+                        text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                        {"name": db_name},
                     )
                 elif self.dialect == DbDialect.MYSQL:
-                    result = await conn.execute(
-                        text("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :dbname"),  # noqa: E501
-                        {"dbname": db_name},
+                    r = await conn.execute(
+                        text(
+                            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA "
+                            "WHERE SCHEMA_NAME = :name"
+                        ),
+                        {"name": db_name},
                     )
                 else:
                     return False
-                return result.scalar() is not None
+                return r.scalar() is not None
         except Exception:
             return False
 
     async def close(self) -> None:
-        logger.info("Closing DatabaseIsolationProvider")
+        """Dispose all per-tenant engines and the master engine."""
         for tid, engine in list(self._engines.items()):
             await engine.dispose()
             logger.debug("Closed engine tenant=%s", tid)
         self._engines.clear()
-        await self._master_engine.dispose()
+        await self._master.dispose()
         logger.info("DatabaseIsolationProvider closed")
 
 

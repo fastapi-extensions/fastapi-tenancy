@@ -1,4 +1,4 @@
-"""Caching utilities for tenant data.
+"""Tenant-scoped Redis cache utilities.
 
 Requires the ``redis`` extra::
 
@@ -7,6 +7,7 @@ Requires the ``redis`` extra::
 
 try:
     from fastapi_tenancy.cache.tenant_cache import TenantCache
+
     __all__ = ["TenantCache"]
 except ImportError:
     TenantCache = None  # type: ignore[assignment, misc]

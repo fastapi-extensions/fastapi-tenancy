@@ -1,22 +1,28 @@
-"""Data isolation strategies.
+"""Data isolation strategies for fastapi-tenancy.
 
-This module provides different strategies for isolating tenant data.
+All isolation providers implement
+:class:`~fastapi_tenancy.isolation.base.BaseIsolationProvider`.
 
-Available strategies:
-- Schema: Separate PostgreSQL schema per tenant
-- Database: Separate database per tenant
-- RLS: Row-Level Security policies
-- Hybrid: Mix strategies based on tenant tier
+Strategies
+----------
+:class:`SchemaIsolationProvider`
+    Dedicated database schema per tenant (PostgreSQL / MSSQL).
+    Falls back to table-name prefix on SQLite and unknown dialects.
 
-Example:
-    ```python
-    from fastapi_tenancy.isolation import SchemaIsolationProvider
+:class:`DatabaseIsolationProvider`
+    Dedicated database instance per tenant (PostgreSQL, MySQL, SQLite).
 
-    provider = SchemaIsolationProvider(config)
+:class:`RLSIsolationProvider`
+    Shared schema with PostgreSQL Row-Level Security.
+    Falls back to explicit ``WHERE tenant_id`` filter on other dialects.
 
-    async with provider.get_session(tenant) as session:
-        users = await session.execute(select(User))
-    ```
+:class:`HybridIsolationProvider`
+    Routes premium tenants to one strategy and standard tenants to another.
+    Reuses a single shared connection pool.
+
+:class:`IsolationProviderFactory`
+    Build any provider from a
+    :class:`~fastapi_tenancy.core.config.TenancyConfig` instance.
 """
 
 from fastapi_tenancy.isolation.base import BaseIsolationProvider

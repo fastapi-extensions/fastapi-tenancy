@@ -1,12 +1,35 @@
-"""Security utilities for tenant operations - Production-grade.
+"""Security utilities for fastapi-tenancy.
 
-This module provides security-related utilities:
-- Secure ID generation
-- API key generation
-- Data masking
-- Password hashing helpers
-- Token generation
+All functions in this module use Python's :mod:`secrets` module which is
+backed by the operating system's cryptographically secure random number
+generator.  Do **not** replace calls here with :mod:`random`.
+
+Public API
+----------
+:func:`generate_tenant_id`
+    Generate a random, URL-safe opaque tenant ID.
+
+:func:`generate_api_key`
+    Generate a random, alphanumeric API key suitable for machine-to-machine
+    authentication.
+
+:func:`generate_secret_key`
+    Generate a long hex-encoded key suitable for JWT secrets and encryption.
+
+:func:`generate_verification_token`
+    Generate a URL-safe token for e-mail / phone verification flows.
+
+:func:`constant_time_compare`
+    Compare two strings in constant time (timing-attack safe).
+
+:func:`hash_value`
+    Compute a SHA-256 hash with optional salt.
+
+:func:`mask_sensitive_data`
+    Redact sensitive keys from a dictionary before logging or serialisation.
 """
+
+from __future__ import annotations
 
 import hashlib
 import secrets
@@ -15,102 +38,151 @@ from typing import Any
 
 
 def generate_tenant_id(prefix: str = "tenant") -> str:
-    """Generate a secure random tenant ID.
+    """Generate a cryptographically secure, URL-safe opaque tenant ID.
 
-    Uses cryptographically secure random generation.
+    The generated ID is *not* a slug — it is an internal primary key
+    intended to be opaque to end-users.  Use the tenant's ``identifier``
+    field for human-readable values.
 
     Args:
-        prefix: Prefix for the ID (default: 'tenant')
+        prefix: Short string prepended to the random part.
+            Defaults to ``"tenant"``.
 
     Returns:
-        Generated tenant ID
+        A string in the form ``"{prefix}-{random}"`` where *random* is
+        12 URL-safe base64 characters.
 
-    Example:
-        ```python
-        tenant_id = generate_tenant_id()
-        # Returns: "tenant-A1b2C3d4E5f6"
+    Example::
 
-        custom_id = generate_tenant_id("org")
-        # Returns: "org-X9y8Z7w6V5u4"
-        ```
+        generate_tenant_id()          # "tenant-aB3xYz9mQp2s"
+        generate_tenant_id("org")     # "org-Kl7nMf4wTv1c"
     """
-    # Generate 12 characters of URL-safe randomness
-    random_part = secrets.token_urlsafe(12)[:12]
-    return f"{prefix}-{random_part}"
+    return f"{prefix}-{secrets.token_urlsafe(12)[:12]}"
 
 
 def generate_api_key(length: int = 32) -> str:
-    """Generate a secure API key.
+    """Generate a random alphanumeric API key.
+
+    The output alphabet is ``[A-Za-z0-9]`` with 62 characters, giving
+    approximately ``log2(62^32) ≈ 190`` bits of entropy for the default
+    length.
 
     Args:
-        length: Length of the key (default: 32)
+        length: Number of characters in the key.  Minimum recommended
+            value is 32.
 
     Returns:
-        Generated API key
+        A random alphanumeric string of *length* characters.
 
-    Example:
-        ```python
-        api_key = generate_api_key()
-        # Returns: "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+    Example::
 
-        long_key = generate_api_key(64)
-        # Returns 64-character key
-        ```
+        generate_api_key()    # "Xy3mPq7nRt2kLs9..."  (32 chars)
+        generate_api_key(64)  # 64-character key
     """
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def generate_secret_key(length: int = 64) -> str:
-    """Generate a secure secret key for JWT or encryption.
+def generate_secret_key(byte_length: int = 64) -> str:
+    """Generate a hex-encoded secret key suitable for JWT secrets and HMAC keys.
+
+    The output is ``2 * byte_length`` hex characters.  The default
+    ``byte_length=64`` yields a 512-bit key.
 
     Args:
-        length: Length of the key in bytes (default: 64)
+        byte_length: Number of random bytes before hex encoding.
 
     Returns:
-        Hex-encoded secret key
+        Hex-encoded random string.
 
-    Example:
-        ```python
-        secret = generate_secret_key()
-        # Returns: Long hex string suitable for JWT_SECRET
-        ```
+    Example::
+
+        secret = generate_secret_key()   # 128-char hex string (512 bits)
     """
-    return secrets.token_hex(length)
+    return secrets.token_hex(byte_length)
+
+
+def generate_verification_token(byte_length: int = 32) -> str:
+    """Generate a URL-safe verification token.
+
+    Suitable for e-mail confirmation links, password-reset tokens, and
+    similar single-use flows.
+
+    Args:
+        byte_length: Number of random bytes before URL-safe base64 encoding.
+
+    Returns:
+        A URL-safe base64-encoded random string.
+
+    Example::
+
+        token = generate_verification_token()
+        url = f"https://app.example.com/verify?token={token}"
+    """
+    return secrets.token_urlsafe(byte_length)
+
+
+def constant_time_compare(value1: str, value2: str) -> bool:
+    """Compare two strings in constant time to prevent timing attacks.
+
+    This is the correct primitive for comparing API keys, HMAC digests,
+    and other secrets.  A naive ``==`` comparison short-circuits on the
+    first differing byte, leaking information about partial matches.
+
+    Args:
+        value1: First string.
+        value2: Second string.
+
+    Returns:
+        ``True`` when both strings are identical.
+    """
+    return secrets.compare_digest(value1, value2)
+
+
+def hash_value(value: str, salt: str | None = None) -> str:
+    """Compute a hex-encoded SHA-256 hash of *value* with an optional *salt*.
+
+    Args:
+        value: The string to hash.
+        salt: Optional salt prepended to *value* before hashing.
+
+    Returns:
+        Lowercase hex-encoded SHA-256 digest (64 characters).
+
+    Example::
+
+        hash_value("my-api-key")
+        hash_value("my-api-key", salt="random-salt-string")
+    """
+    payload = f"{salt}{value}" if salt else value
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def mask_sensitive_data(
     data: dict[str, Any],
     sensitive_keys: list[str] | None = None,
-    mask_char: str = "*",
+    mask: str = "***MASKED***",
 ) -> dict[str, Any]:
-    """Mask sensitive data in dictionary.
+    """Return a copy of *data* with sensitive values replaced by *mask*.
+
+    Key matching is case-insensitive substring search against the default
+    (or caller-supplied) list of sensitive keywords.
 
     Args:
-        data: Dictionary to mask
-        sensitive_keys: List of keys to mask (default: common sensitive fields)
-        mask_char: Character to use for masking (default: '*')
+        data: The dictionary to sanitise.
+        sensitive_keys: List of keyword substrings that mark a key as
+            sensitive.  Defaults to a curated list covering common credential
+            and secret field names.
+        mask: Replacement string for masked values.
 
     Returns:
-        Dictionary with masked values
+        A shallow copy of *data* with sensitive string values replaced.
+        Non-string values at matching keys are also replaced.
 
-    Example:
-        ```python
-        data = {
-            "username": "john",
-            "password": "secret123",
-            "api_key": "abc123xyz",
-            "email": "john@example.com"
-        }
+    Example::
 
-        masked = mask_sensitive_data(data)
-        # Returns: {
-        #     "username": "john",
-        #     "password": "***MASKED***",
-        #     "api_key": "***MASKED***",
-        #     "email": "john@example.com"
-        # }
-        ```
+        mask_sensitive_data({"username": "alice", "password": "s3cr3t"})
+        # → {"username": "alice", "password": "***MASKED***"}
     """
     if sensitive_keys is None:
         sensitive_keys = [
@@ -124,87 +196,16 @@ def mask_sensitive_data(
             "private_key",
             "access_token",
             "refresh_token",
+            "encryption_key",
+            "jwt_secret",
         ]
 
-    masked = data.copy()
-
-    for key in masked:
-        # Check if key contains any sensitive keyword
+    result = dict(data)
+    for key in result:
         key_lower = key.lower()
         if any(sensitive in key_lower for sensitive in sensitive_keys):
-            if isinstance(masked[key], str):
-                # Mask the value
-                masked[key] = f"{mask_char * 3}MASKED{mask_char * 3}"
-            else:
-                masked[key] = "***MASKED***"
-
-    return masked
-
-
-def hash_value(value: str, salt: str | None = None) -> str:
-    """Hash a value using SHA-256.
-
-    Args:
-        value: Value to hash
-        salt: Optional salt to add
-
-    Returns:
-        Hex-encoded hash
-
-    Example:
-        ```python
-        hashed = hash_value("my-secret-value")
-        # Returns: SHA-256 hash
-
-        salted = hash_value("value", salt="random-salt")
-        # Returns: SHA-256 hash of value + salt
-        ```
-    """
-    if salt:
-        value = f"{value}{salt}"
-
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
-def generate_verification_token(length: int = 32) -> str:
-    """Generate a verification token for email/phone verification.
-
-    Args:
-        length: Length of the token (default: 32)
-
-    Returns:
-        URL-safe verification token
-
-    Example:
-        ```python
-        token = generate_verification_token()
-        # Use in email: https://app.com/verify?token={token}
-        ```
-    """
-    return secrets.token_urlsafe(length)
-
-
-def constant_time_compare(val1: str, val2: str) -> bool:
-    """Compare two strings in constant time.
-
-    Prevents timing attacks when comparing secrets.
-
-    Args:
-        val1: First value
-        val2: Second value
-
-    Returns:
-        True if values are equal
-
-    Example:
-        ```python
-        # Safe comparison of API keys
-        if constant_time_compare(provided_key, stored_key):
-            # API key is valid
-            ...
-        ```
-    """
-    return secrets.compare_digest(val1, val2)
+            result[key] = mask
+    return result
 
 
 __all__ = [

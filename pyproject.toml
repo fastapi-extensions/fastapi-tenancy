@@ -1,0 +1,30 @@
+
+[build-system]
+requires = ["uv_build>=0.8.23,<0.9.0"]
+build-backend = "uv_build"
+
+# Project
+[project]
+name = "fastapi-tenancy"
+version = "0.1.0"
+description = "Enterprise-grade multi-tenancy for FastAPI — schema, database, RLS, and hybrid isolation with full async support"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "fastapi-tenancy contributors" }]
+keywords = ["fastapi", "multitenancy", "saas", "postgresql", "sqlalchemy", "async"]
+dependencies = []
+
+[project.scripts]
+fastapi-tenancy = "fastapi_tenancy:main"
+
+[project.urls]
+Homepage = "https://github.com/KapilDagur/fastapi-tenancy"
+
+
+# Build
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastapi_tenancy"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/fastapi_tenancy/py.typed" = "fastapi_tenancy/py.typed"

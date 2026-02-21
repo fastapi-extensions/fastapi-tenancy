@@ -218,6 +218,7 @@ class Tenant(BaseModel):
         return hash(self.id)
 
     def __repr__(self) -> str:
+        """Return ``__repr__`` string for debugging purpose."""
         return f"Tenant(id={self.id!r}, identifier={self.identifier!r}, status={self.status!r})"
 
     #####################
@@ -375,7 +376,7 @@ class TenantResolver(Protocol):
         assert isinstance(CookieTenantResolver(store), TenantResolver)
     """
 
-    async def resolve(self, request: "Request") -> Tenant:
+    async def resolve(self, request: Request) -> Tenant:
         """Resolve the current tenant from *request*.
 
         Args:
@@ -409,11 +410,11 @@ class IsolationProvider(Protocol):
             async def destroy_tenant(self, tenant, **kw): ...
     """
 
-    def get_session(self, tenant: Tenant) -> "AsyncIterator[Any]":
+    def get_session(self, tenant: Tenant) -> AsyncIterator[Any]:
         """Yield a session scoped to *tenant*'s namespace."""
         ...
 
-    async def apply_filters(self, query: "SelectT", tenant: Tenant) -> "SelectT":
+    async def apply_filters(self, query: SelectT, tenant: Tenant) -> SelectT:
         """Return *query* filtered to only expose *tenant*'s data."""
         ...
 
@@ -426,7 +427,7 @@ class IsolationProvider(Protocol):
         ...
 
 
-__all__ = [
+__all__ = [ # noqa
     # Type variables
     "SelectT",
     "TenantT",

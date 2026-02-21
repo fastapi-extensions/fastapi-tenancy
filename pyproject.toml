@@ -7,12 +7,12 @@ build-backend = "hatchling.build"
 [project]
 name = "fastapi-tenancy"
 version = "0.2.0"
-description = "Enterprise-grade multi-tenancy for FastAPI — schema, database, RLS, and hybrid isolation with full async support"
+description = "Production-ready multi-tenancy for FastAPI — schema, database, RLS, and hybrid isolation with full async support."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "fastapi-tenancy contributors" }]
-keywords = ["fastapi", "multitenancy", "saas", "postgresql", "sqlalchemy", "async"]
+keywords = ["fastapi", "multitenancy", "saas", "mysql", "mssql", "postgresql", "redis", "sqlalchemy", "redis", "async"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: FastAPI",
@@ -77,10 +77,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage      = "https://github.com/KapilDagur/fastapi-tenancy"
+Homepage      = "https://github.com/fastapi-extensions/fastapi-tenancy"
 Documentation = "https://fastapi-tenancy.readthedocs.io"
-Repository    = "https://github.com/KapilDagur/fastapi-tenancy"
-"Bug Tracker" = "https://github.com/KapilDagur/fastapi-tenancy/issues"
+Repository    = "https://github.com/fastapi-extensions/fastapi-tenancy"
+"Bug Tracker" = "https://github.com/fastapi-extensions/fastapi-tenancy/issues"
 
 # Build
 [tool.hatch.build.targets.wheel]

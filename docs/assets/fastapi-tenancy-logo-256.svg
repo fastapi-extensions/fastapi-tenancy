@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg256" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#009688"/>
+      <stop offset="100%" style="stop-color:#00BFA5"/>
+    </linearGradient>
+    <linearGradient id="bolt256" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff"/>
+      <stop offset="100%" style="stop-color:#e0f2f1"/>
+    </linearGradient>
+    <filter id="shadow256">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#00695c" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="48" ry="48" fill="url(#bg256)"/>
+  <line x1="64" y1="0" x2="64" y2="256" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <line x1="128" y1="0" x2="128" y2="256" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <line x1="192" y1="0" x2="192" y2="256" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <line x1="0" y1="64" x2="256" y2="64" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <line x1="0" y1="128" x2="256" y2="128" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <line x1="0" y1="192" x2="256" y2="192" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.05"/>
+  <!-- tenant layer lines left -->
+  <rect x="26" y="90" width="18" height="5" rx="2.5" fill="#ffffff" opacity="0.18"/>
+  <rect x="26" y="99" width="14" height="5" rx="2.5" fill="#ffffff" opacity="0.13"/>
+  <rect x="26" y="108" width="16" height="5" rx="2.5" fill="#ffffff" opacity="0.10"/>
+  <!-- lightning bolt -->
+  <g filter="url(#shadow256)">
+    <polygon points="145,40 100,141 129,141 111,216 161,115 131,115 155,40" fill="url(#bolt256)"/>
+  </g>
+  <!-- layered floors -->
+  <rect x="84" y="135" width="88" height="7" rx="3.5" fill="#ffffff" opacity="0.22"/>
+  <rect x="91" y="145" width="74" height="5" rx="2.5" fill="#ffffff" opacity="0.15"/>
+  <rect x="98" y="153" width="60" height="4" rx="2" fill="#ffffff" opacity="0.10"/>
+  <!-- tenant dots right -->
+  <circle cx="212" cy="105" r="4" fill="#ffffff" opacity="0.28"/>
+  <circle cx="212" cy="117" r="4" fill="#ffffff" opacity="0.20"/>
+  <circle cx="212" cy="129" r="4" fill="#ffffff" opacity="0.13"/>
+  <line x1="216" y1="105" x2="216" y2="129" stroke="#ffffff" stroke-width="1" opacity="0.13"/>
+</svg>

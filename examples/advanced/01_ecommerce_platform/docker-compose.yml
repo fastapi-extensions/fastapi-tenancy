@@ -1,0 +1,43 @@
+version: "3.9"
+
+# Multi-Tenant E-Commerce Platform
+#
+# Services:
+#   postgres  — main platform DB (tenants metadata + audit_logs)
+#               + dynamically created per-tenant databases
+#   app       — FastAPI application
+#
+# The postgres superuser can CREATE DATABASE for new tenants.
+# In production use a service account with limited privileges + pre-created DBs.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: saas_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MAIN_DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres/saas_platform"
+      TENANT_DATABASE_TEMPLATE: "postgresql+asyncpg://postgres:postgres@postgres/{database_name}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="boltDark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#009688"/>
+      <stop offset="100%" style="stop-color:#00BFA5"/>
+    </linearGradient>
+    <filter id="shadowDark">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#009688" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- Transparent background - no fill -->
+
+  <!-- Outer ring -->
+  <circle cx="128" cy="128" r="120" fill="none" stroke="url(#boltDark)" stroke-width="3" stroke-opacity="0.4"/>
+  <circle cx="128" cy="128" r="108" fill="none" stroke="url(#boltDark)" stroke-width="1" stroke-opacity="0.2"/>
+
+  <!-- Lightning bolt (teal) -->
+  <g filter="url(#shadowDark)">
+    <polygon points="145,40 100,141 129,141 111,216 161,115 131,115 155,40" fill="url(#boltDark)"/>
+  </g>
+
+  <!-- stacked tenancy layers -->
+  <rect x="84" y="135" width="88" height="6" rx="3" fill="#009688" opacity="0.55"/>
+  <rect x="91" y="144" width="74" height="5" rx="2.5" fill="#009688" opacity="0.40"/>
+  <rect x="98" y="152" width="60" height="4" rx="2" fill="#009688" opacity="0.28"/>
+
+  <!-- tenant dots -->
+  <circle cx="212" cy="108" r="4" fill="#00BFA5" opacity="0.50"/>
+  <circle cx="212" cy="121" r="4" fill="#00BFA5" opacity="0.35"/>
+  <circle cx="212" cy="134" r="4" fill="#00BFA5" opacity="0.22"/>
+</svg>

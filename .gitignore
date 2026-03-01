@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Distribution / packaging 
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+wheels/
+sdist/
+var/
+.eggs/
+lib/
+lib64/
+parts/
+develop-eggs/
+.installed.cfg
+uv.lock
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Testing
+.tox/
+.nox/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+nosetests.xml
+test-results/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Linting
+.ruff_cache/
+
+# SQLite databases (local dev / test)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets / environment
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Documentation builds
+docs/_build/
+docs/.doctrees/
+site/
+
+# CI
+.benchmarks/
+.hypothesis/
+
+# Backup files
+*.bak
+*.orig
+*.tmp
+*.swp
+*~
+
+# Editor artifacts
+.vscode/
+.idea/
+*.iml

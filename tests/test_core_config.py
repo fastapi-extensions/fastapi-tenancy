@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 import warnings
 
@@ -12,6 +13,15 @@ from fastapi_tenancy.core.config import TenancyConfig
 from fastapi_tenancy.core.types import IsolationStrategy, ResolutionStrategy
 
 SQLITE_URL = "sqlite+aiosqlite:///:memory:"
+
+_TENANCY_VARS = [k for k in os.environ if k.startswith("TENANCY_")]
+
+
+@pytest.fixture(autouse=True)
+def _clear_tenancy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove all TENANCY_* environment variables for the duration of each test."""
+    for var in _TENANCY_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 def make_config(**kwargs: Any) -> TenancyConfig:

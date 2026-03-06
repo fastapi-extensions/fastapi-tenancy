@@ -23,9 +23,10 @@ if TYPE_CHECKING:
 
 _SQLITE_MEM: str = "sqlite+aiosqlite:///:memory:"
 
-_PG_URL: str = os.getenv(
-    "POSTGRES_URL",
-    "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+_PG_URL: str = (
+    os.getenv("POSTGRES_URL")
+    or os.getenv("TENANCY_DATABASE_URL")
+    or "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db"
 )
 _MYSQL_URL: str = os.getenv(
     "MYSQL_URL",

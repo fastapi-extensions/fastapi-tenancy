@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg128" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#009688"/>
+      <stop offset="100%" style="stop-color:#00BFA5"/>
+    </linearGradient>
+    <filter id="shadow128">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#00695c" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <rect x="0" y="0" width="128" height="128" rx="24" ry="24" fill="url(#bg128)"/>
+  <g filter="url(#shadow128)">
+    <polygon points="72,20 50,71 65,71 55,108 80,57 65,57 77,20" fill="#ffffff"/>
+  </g>
+  <!-- stacked layer bars -->
+  <rect x="42" y="67" width="44" height="4" rx="2" fill="#ffffff" opacity="0.25"/>
+  <rect x="46" y="73" width="36" height="3" rx="1.5" fill="#ffffff" opacity="0.18"/>
+  <rect x="50" y="78" width="28" height="3" rx="1.5" fill="#ffffff" opacity="0.12"/>
+</svg>

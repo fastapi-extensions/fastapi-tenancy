@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg512" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#009688"/>
+      <stop offset="100%" style="stop-color:#00BFA5"/>
+    </linearGradient>
+    <linearGradient id="bolt512" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff"/>
+      <stop offset="100%" style="stop-color:#e0f2f1"/>
+    </linearGradient>
+    <linearGradient id="layers512" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffffff" stop-opacity="0.95"/>
+      <stop offset="100%" style="stop-color:#b2dfdb" stop-opacity="0.85"/>
+    </linearGradient>
+    <filter id="shadow512" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#00695c" flood-opacity="0.4"/>
+    </filter>
+    <filter id="innerGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <clipPath id="roundClip512">
+      <rect x="0" y="0" width="512" height="512" rx="96" ry="96"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="512" height="512" rx="96" ry="96" fill="url(#bg512)"/>
+
+  <!-- Subtle grid texture -->
+  <rect x="0" y="0" width="512" height="512" rx="96" ry="96" fill="none" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="128" y1="0" x2="128" y2="512" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="256" y1="0" x2="256" y2="512" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="384" y1="0" x2="384" y2="512" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="0" y1="128" x2="512" y2="128" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="0" y1="256" x2="512" y2="256" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+  <line x1="0" y1="384" x2="512" y2="384" stroke="#ffffff" stroke-width="0.4" stroke-opacity="0.05"/>
+
+  <!-- Stacked tenant layer indicators (left side, decorative) -->
+  <rect x="52" y="180" width="36" height="10" rx="5" fill="#ffffff" opacity="0.18"/>
+  <rect x="52" y="198" width="28" height="10" rx="5" fill="#ffffff" opacity="0.13"/>
+  <rect x="52" y="216" width="32" height="10" rx="5" fill="#ffffff" opacity="0.10"/>
+
+  <!-- Main lightning bolt (FastAPI-inspired, centered) -->
+  <g filter="url(#shadow512)">
+    <polygon points="290,80 200,282 258,282 222,432 322,230 262,230 310,80" fill="url(#bolt512)"/>
+  </g>
+
+  <!-- Layered tenancy floors behind bolt -->
+  <rect x="168" y="270" width="176" height="14" rx="7" fill="#ffffff" opacity="0.22"/>
+  <rect x="182" y="290" width="148" height="10" rx="5" fill="#ffffff" opacity="0.16"/>
+  <rect x="196" y="306" width="120" height="8" rx="4" fill="#ffffff" opacity="0.10"/>
+
+  <!-- Tenant dots (right side) -->
+  <circle cx="424" cy="210" r="7" fill="#ffffff" opacity="0.30"/>
+  <circle cx="424" cy="232" r="7" fill="#ffffff" opacity="0.22"/>
+  <circle cx="424" cy="254" r="7" fill="#ffffff" opacity="0.15"/>
+  <line x1="431" y1="210" x2="431" y2="254" stroke="#ffffff" stroke-width="1.5" opacity="0.15"/>
+</svg>

@@ -1,0 +1,94 @@
+name: Bug Report
+description: Report a bug in fastapi-tenancy
+labels: ["bug", "needs-triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report!
+        Please fill out the sections below as completely as possible.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the bug.
+      placeholder: "When I do X, Y happens instead of Z."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal reproducible example
+      render: python
+      placeholder: |
+        from fastapi_tenancy import TenancyManager, TenancyConfig
+        
+        config = TenancyConfig(database_url="...", ...)
+        # ... steps that reproduce the issue
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behaviour
+      description: Include full traceback if applicable
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: fastapi-tenancy Version
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python Version
+      placeholder: "3.12.1"
+    validations:
+      required: true
+
+  - type: input
+    id: database
+    attributes:
+      label: Database + Driver
+      placeholder: "PostgreSQL 16 + asyncpg 0.29.0"
+
+  - type: dropdown
+    id: isolation
+    attributes:
+      label: Isolation Strategy
+      options:
+        - schema
+        - database
+        - rls
+        - hybrid
+        - N/A
+
+  - type: dropdown
+    id: resolution
+    attributes:
+      label: Resolution Strategy
+      options:
+        - header
+        - subdomain
+        - path
+        - jwt
+        - custom
+        - N/A

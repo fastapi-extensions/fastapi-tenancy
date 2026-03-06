@@ -1,0 +1,141 @@
+################### :: Test infrastructure for fastapi-tenancy :: #####################
+# Starts all external services needed by every vendor test + Redis.                   #
+#                                                                                     #
+# Usage:                                                                              #
+#   docker compose -f docker-compose.test.yml up -d                                   #
+#   pytest tests/storage/ --tb=short -v                                               #
+#   docker compose -f docker-compose.test.yml down -v                                 #
+#                                                                                     #
+# Default URLs (match tests/conftest.py):                                             #
+#                                                                                     #
+# POSTGRES_URL                                                                        #
+#   postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db                   #
+#                                                                                     #
+# MYSQL_URL                                                                           #
+#   mysql+aiomysql://testing:Testing123!@localhost:3306/test_db                       #
+#                                                                                     #
+# MSSQL_URL (Note: uses 'sa' - MSSQL doesn't support custom user at init)             #
+#   mssql+aioodbc://sa:Testing123!@localhost:1433/test_db                             #
+#   ?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes                  #
+#                                                                                     #
+# REDIS_URL                                                                           #
+#   redis://localhost:6379/0                                                           #
+#######################################################################################
+
+services:
+
+  # PostgreSQL 16
+  postgres:
+    image: postgres:16-alpine
+    container_name: ft_test_postgres
+    environment:
+      POSTGRES_USER: testing
+      POSTGRES_PASSWORD: Testing123!
+      POSTGRES_DB: test_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testing -d test_db"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ft_pg_data:/var/lib/postgresql/data
+    tmpfs:
+      - /tmp
+
+  # MySQL 8.0
+  mysql:
+    image: mysql:8.0
+    container_name: ft_test_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: Testing123!
+      MYSQL_DATABASE: test_db
+      MYSQL_USER: testing
+      MYSQL_PASSWORD: Testing123!
+      MYSQL_ROOT_HOST: "%"
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-utesting", "-pTesting123!"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ft_mysql_data:/var/lib/mysql
+
+  # SQL Server 2022 (Developer)
+  # Note: MSSQL doesn't support custom username at container creation
+  # Database 'test_db' is created via entrypoint wrapper script
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ft_test_mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Testing123!"
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd
+          -S localhost -U sa -P 'Testing123!'
+          -C -Q 'SELECT 1 FROM sys.databases WHERE name = N''test_db''' 2>/dev/null | grep -q '(1 rows affected)'
+      interval: 10s
+      timeout: 15s
+      retries: 30
+      start_period: 60s
+    volumes:
+      - ft_mssql_data:/var/opt/mssql
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      echo 'Starting SQL Server...';
+      /opt/mssql/bin/sqlservr &
+      SQLSERVER_PID=$$!;
+      echo 'Waiting for SQL Server to be ready...';
+      for i in {1..60}; do
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Testing123!' -C -Q 'SELECT 1' &>/dev/null && break;
+        echo \"Attempt $$i/60: SQL Server not ready yet...\";
+        sleep 2;
+      done;
+      echo 'SQL Server is ready. Creating test database...';
+      /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Testing123!' -C -Q \"
+        IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'test_db')
+        BEGIN
+          CREATE DATABASE test_db
+          COLLATE Latin1_General_100_CI_AS_SC_UTF8;
+        END;
+        ALTER DATABASE test_db SET RECOVERY SIMPLE;
+      \" 2>&1;
+      echo 'MSSQL initialization complete.';
+      wait $$SQLSERVER_PID;
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # Redis 7
+  redis:
+    image: redis:7-alpine
+    container_name: ft_test_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    command: redis-server --save "" --appendonly no
+
+volumes:
+  ft_pg_data:
+  ft_mysql_data:
+  ft_mssql_data:

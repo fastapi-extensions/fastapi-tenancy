@@ -141,11 +141,11 @@ class TestMakeTenantDbDependency:
         app = _make_app(manager)
 
         get_db = make_tenant_db_dependency(manager)
-        session_ids: list[int] = []
+        sessions_seen: list[AsyncSession] = []
 
         @app.get("/session-id")
         async def session_id(session: AsyncSession = Depends(get_db)) -> dict[str, int]:
-            session_ids.append(id(session))
+            sessions_seen.append(session)
             return {"id": id(session)}
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -154,8 +154,12 @@ class TestMakeTenantDbDependency:
 
         assert r1.status_code == 200
         assert r2.status_code == 200
-        # Different requests should yield different session objects
-        assert session_ids[0] != session_ids[1]
+        # Both sessions must have been created (two distinct requests)
+        assert len(sessions_seen) == 2
+        # Keeping references prevents CPython from reusing the same memory
+        # address for both objects — id() comparison is only reliable when
+        # both objects are alive simultaneously.
+        assert sessions_seen[0] is not sessions_seen[1]
 
     @pytest.mark.asyncio
     async def test_context_cleared_after_each_request(self) -> None:

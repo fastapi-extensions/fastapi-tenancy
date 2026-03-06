@@ -10,7 +10,7 @@ build:
     python: "3.12"
   jobs:
     pre_build:
-      - pip install -e "../.[dev]" || true  # install project for mkdocstrings
+      - pip install -e ".[dev]" || true  # install project for mkdocstrings
 
 mkdocs:
   configuration: mkdocs.yml

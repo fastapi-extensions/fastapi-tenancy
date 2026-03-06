@@ -86,7 +86,7 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [../src]
+          paths: [src]
           options:
             docstring_style: google
             show_root_heading: true

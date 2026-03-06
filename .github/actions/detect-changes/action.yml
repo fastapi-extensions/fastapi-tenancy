@@ -1,0 +1,42 @@
+name: "Detect Changes"
+description: "Detect which areas of the repo changed to skip unnecessary jobs."
+
+outputs:
+  src:
+    description: "true if library source changed"
+    value: ${{ steps.filter.outputs.src }}
+  tests:
+    description: "true if test files changed"
+    value: ${{ steps.filter.outputs.tests }}
+  docs:
+    description: "true if documentation changed"
+    value: ${{ steps.filter.outputs.docs }}
+  workflows:
+    description: "true if workflow files changed"
+    value: ${{ steps.filter.outputs.workflows }}
+  deps:
+    description: "true if dependency files changed"
+    value: ${{ steps.filter.outputs.deps }}
+
+runs:
+  using: composite
+  steps:
+    - name: Filter changed paths
+      id: filter
+      uses: dorny/paths-filter@v3
+      with:
+        filters: |
+          src:
+            - 'src/**'
+          tests:
+            - 'tests/**'
+          docs:
+            - 'docs/**'
+            - 'mkdocs.yml'
+            - '*.md'
+            - 'overrides/**'
+          workflows:
+            - '.github/**'
+          deps:
+            - 'pyproject.toml'
+            - 'uv.lock'

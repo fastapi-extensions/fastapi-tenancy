@@ -75,6 +75,8 @@ jobs:
     env:
       TENANCY_DATABASE_URL: "postgresql+asyncpg://test:test@localhost:5432/test"
       TENANCY_REDIS_URL: "redis://localhost:6379/0"
+      POSTGRES_URL: "postgresql+asyncpg://test:test@localhost:5432/test"
+      REDIS_URL: "redis://localhost:6379/0"
 
     steps:
       - uses: actions/checkout@v4

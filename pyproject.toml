@@ -35,6 +35,7 @@ dependencies = [
     "pydantic-settings>=2.3.0",   # Settings management
     "sqlalchemy[asyncio]>=2.0.30",# SQLAlchemy 2.0 async stable
     "anyio>=4.0.0",               # Async abstraction layer
+    "cryptography>=46.0.5",       # Cryptographic hashing
 ]
 
 # Optional extras

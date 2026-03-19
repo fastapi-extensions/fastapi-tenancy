@@ -324,16 +324,25 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
                 kw["pool_pre_ping"] = self.config.database_pool_pre_ping
                 kw["pool_recycle"] = self.config.database_pool_recycle
 
-            engine = create_async_engine(url, **kw)
-            evicted = await self._engine_cache.put(tenant.id, engine)
-            if evicted is not None:
-                try:
-                    await evicted.dispose()
-                except Exception as exc:
-                    logger.warning("Error disposing evicted engine: %s", exc)
-            logger.debug(
-                "Created engine tenant=%s cached_count=%d", tenant.id, self._engine_cache.size
-            )
+            try:
+                engine = create_async_engine(url, **kw)
+                evicted = await self._engine_cache.put(tenant.id, engine)
+                if evicted is not None:
+                    try:
+                        await evicted.dispose()
+                    except Exception as exc:
+                        logger.warning("Error disposing evicted engine: %s", exc)
+                logger.debug(
+                    "Created engine tenant=%s cached_count=%d", tenant.id, self._engine_cache.size
+                )
+            except Exception:
+                # Clean up the creation lock immediately on failure so the dict
+                # does not leak entries for tenants whose engine creation failed.
+                # Without this finally block, the lock remains in _creation_locks
+                # permanently because the cleanup below is never reached.
+                async with self._creation_locks_lock:
+                    self._creation_locks.pop(tenant.id, None)
+                raise
 
         # Clean up the per-tenant creation lock after the engine is cached so
         # that the _creation_locks dict does not grow without bound in

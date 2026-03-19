@@ -59,7 +59,7 @@ Custom audit log writer::
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from fastapi_tenancy.core.exceptions import (
     ConfigurationError,
@@ -77,7 +77,6 @@ from fastapi_tenancy.utils.security import generate_tenant_id
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from typing import Protocol
 
     from sqlalchemy import MetaData
 
@@ -90,38 +89,102 @@ logger = logging.getLogger(__name__)
 
 
 ###########################
-# AuditLogWriter protocol #
+# CachingStoreProxy       #
 ###########################
 
 
-if TYPE_CHECKING:
+class _CachingStoreProxy:
+    """Transparent proxy that adds an in-process L1 LRU+TTL cache in front of any store.
 
-    class AuditLogWriter(Protocol):
-        """Structural protocol for audit log persistence backends.
+    Only ``get_by_identifier`` is intercepted (the hot path called on every
+    request by the resolver).  All other ``TenantStore`` methods are delegated
+    directly to the underlying store so the proxy is transparent to callers.
 
-        Implement this interface to persist audit log entries to any backend —
-        a database table, CloudWatch, Datadog, a message queue, etc.::
+    The L1 cache is populated on miss and invalidated on write operations
+    (``create``, ``update``, ``set_status``, ``delete``) to prevent stale reads.
 
-            from fastapi_tenancy.manager import AuditLogWriter
-            from fastapi_tenancy.core.types import AuditLog
+    Args:
+        store: Underlying :class:`~fastapi_tenancy.storage.tenant_store.TenantStore`.
+        l1_cache: Configured :class:`~fastapi_tenancy.cache.tenant_cache.TenantCache`.
+    """
 
-            class DatabaseAuditWriter:
-                async def write(self, entry: AuditLog) -> None:
-                    await db.execute(insert(AuditTable).values(**entry.model_dump()))
+    def __init__(self, store: Any, l1_cache: Any) -> None:
+        self._store = store
+        self._l1 = l1_cache
 
-            manager = TenancyManager(config, store, audit_writer=DatabaseAuditWriter())
+    def __getattr__(self, name: str) -> Any:
+        # Delegate all non-overridden attributes to the backing store.
+        return getattr(self._store, name)
 
-        The default implementation (used when no writer is supplied) logs the
-        entry at ``INFO`` level via Python's standard logging.
+    async def get_by_identifier(self, identifier: str) -> Tenant:
+        """Return tenant from L1 cache on hit, or store on miss (and populate cache).
+
+        Args:
+            identifier: Tenant slug.
+
+        Returns:
+            The resolved :class:`~fastapi_tenancy.core.types.Tenant`.
+
+        Raises:
+            TenantNotFoundError: When the identifier is not found in store.
         """
+        cached = self._l1.get_by_identifier(identifier)
+        if cached is not None:
+            logger.debug("L1 cache hit for identifier=%r", identifier)
+            return cached
 
-        async def write(self, entry: AuditLog) -> None:
-            """Persist *entry* to the audit log.
+        tenant = await self._store.get_by_identifier(identifier)
+        self._l1.set(tenant)
+        logger.debug("L1 cache miss — populated for identifier=%r", identifier)
+        return tenant
 
-            Args:
-                entry: The audit log entry to persist.
-            """
-            ...
+    async def create(self, tenant: Tenant) -> Tenant:
+        result = await self._store.create(tenant)
+        self._l1.invalidate(result.id)
+        return result
+
+    async def update(self, tenant: Tenant) -> Tenant:
+        result = await self._store.update(tenant)
+        self._l1.invalidate(result.id)
+        return result
+
+    async def set_status(self, tenant_id: str, status: Any) -> Tenant:
+        result = await self._store.set_status(tenant_id, status)
+        self._l1.invalidate(tenant_id)
+        return result
+
+    async def delete(self, tenant_id: str) -> None:
+        await self._store.delete(tenant_id)
+        self._l1.invalidate(tenant_id)
+
+
+@runtime_checkable
+class AuditLogWriter(Protocol):
+    """Structural protocol for audit log persistence backends.
+
+    Implement this interface to persist audit log entries to any backend —
+    a database table, CloudWatch, Datadog, a message queue, etc.::
+
+        from fastapi_tenancy.manager import AuditLogWriter
+        from fastapi_tenancy.core.types import AuditLog
+
+        class DatabaseAuditWriter:
+            async def write(self, entry: AuditLog) -> None:
+                await db.execute(insert(AuditTable).values(**entry.model_dump()))
+
+        manager = TenancyManager(config, store, audit_writer=DatabaseAuditWriter())
+
+    The default implementation (used when no writer is supplied) logs the
+    entry at ``INFO`` level via Python's standard logging.
+    """
+
+    async def write(self, entry: AuditLog) -> None:
+        """Persist *entry* to the audit log.
+
+        Args:
+            entry: The audit log entry to persist.
+        """
+        ...
 
 
 class _DefaultAuditLogWriter:
@@ -291,8 +354,28 @@ class TenancyManager:
         audit_writer: Any | None = None,
     ) -> None:
         self.config = config
-        self.store = store
-        self.resolver: TenantResolver = _build_resolver(config, store, custom_resolver)
+
+        # Build L1 cache first so we can wrap the store before the resolver
+        # is constructed — the resolver will then call get_by_identifier on
+        # the proxy, getting automatic L1 cache hits on every warm request.
+        self._l1_cache: Any = None
+        _effective_store: Any = store
+        if config.cache_enabled:
+            from fastapi_tenancy.cache.tenant_cache import TenantCache  # noqa: PLC0415
+
+            self._l1_cache = TenantCache(
+                max_size=getattr(config, "l1_cache_max_size", 1000),
+                ttl=getattr(config, "l1_cache_ttl_seconds", 60),
+            )
+            _effective_store = _CachingStoreProxy(store, self._l1_cache)
+            logger.info(
+                "L1 TenantCache wired max_size=%d ttl=%ds",
+                self._l1_cache._max_size,
+                self._l1_cache._ttl,
+            )
+
+        self.store = _effective_store
+        self.resolver: TenantResolver = _build_resolver(config, _effective_store, custom_resolver)
         self.isolation_provider: BaseIsolationProvider = (
             isolation_provider if isolation_provider is not None else _build_provider(config)
         )
@@ -303,6 +386,14 @@ class TenancyManager:
         )
         self._rate_limiter: Any = None  # Lazy-initialised from Redis.
         self._rate_limiting_enabled: bool = config.enable_rate_limiting
+
+        # Field-level encryption — None when enable_encryption=False.
+        from fastapi_tenancy.utils.encryption import TenancyEncryption  # noqa: PLC0415
+
+        self._encryption: TenancyEncryption | None = TenancyEncryption.from_config(config)
+        if self._encryption is not None:
+            logger.info("Field-level encryption enabled (Fernet/AES-128-CBC+HMAC-SHA256)")
+
         logger.info(
             "TenancyManager created resolver=%s isolation=%s audit_writer=%s",
             type(self.resolver).__name__,
@@ -332,6 +423,9 @@ class TenancyManager:
         if self.config.cache_enabled and hasattr(self.store, "warm_cache"):
             await self.store.warm_cache()
             logger.info("Cache warmed")
+
+        if self._l1_cache is not None:
+            logger.info("L1 in-process tenant cache active")
 
         if self.config.enable_rate_limiting and self.config.redis_url:
             await self._init_rate_limiter()
@@ -447,6 +541,10 @@ class TenancyManager:
             metadata=metadata or {},
         )
 
+        # Encrypt sensitive fields before writing to the store.
+        if self._encryption is not None:
+            tenant = self._encryption.encrypt_tenant_fields(tenant)
+
         created = await self.store.create(tenant)
         logger.info("Registered tenant id=%s identifier=%s", created.id, created.identifier)
 
@@ -454,16 +552,46 @@ class TenancyManager:
             await self.isolation_provider.initialize_tenant(created, metadata=app_metadata)
         except Exception as exc:
             # Rollback: remove from store so the identifier is not poisoned.
-            try:  # noqa: SIM105
+            try:
                 await self.store.delete(created.id)
-            except Exception:  # pragma: no cover  # noqa: S110
-                pass
+            except Exception as rollback_exc:  # pragma: no cover
+                logger.error(  # noqa: TRY400
+                    "Rollback failed for tenant %s after initialize_tenant error — "
+                    "identifier %r may be poisoned in the store: %s",
+                    created.id,
+                    identifier,
+                    rollback_exc,
+                )
             raise TenancyError(
                 f"Failed to initialise tenant {created.id!r}: {exc}",
                 details={"identifier": identifier},
             ) from exc
 
+        # Return a decrypted copy so callers receive plaintext values.
+        if self._encryption is not None:
+            return self._encryption.decrypt_tenant_fields(created)
         return created
+
+    def decrypt_tenant(self, tenant: Tenant) -> Tenant:
+        """Return *tenant* with sensitive fields decrypted.
+
+        Call this after loading a tenant from the store whenever the result
+        will be passed to application code (e.g. in route handlers, background
+        tasks, or audit logs that should not see ciphertext).
+
+        When encryption is disabled (enable_encryption=False) this method
+        is a no-op and returns *tenant* unchanged.
+
+        Args:
+            tenant: A :class: instance
+                that may have encrypted field values.
+
+        Returns:
+            A Tenant instance with plaintext field values.
+        """
+        if self._encryption is None:
+            return tenant
+        return self._encryption.decrypt_tenant_fields(tenant)
 
     async def suspend_tenant(self, tenant_id: str) -> Tenant:
         """Suspend a tenant, blocking all future requests.
@@ -668,6 +796,53 @@ return count + 1
             entry: The audit log entry to persist.
         """
         await self._audit_writer.write(entry)
+
+    ###########
+    # Metrics #
+    ###########
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Return a snapshot of runtime metrics for this manager instance.
+
+        Metrics are always collected internally.  When ``enable_metrics=False``
+        this method still returns the snapshot — the flag is intended to gate
+        *external* exposure (e.g. a ``/metrics`` endpoint) rather than
+        collection itself.
+
+        Returns:
+            A dict with the following keys:
+
+            * ``l1_cache`` — L1 TenantCache statistics (hit/miss counts,
+              hit rate, current size) or ``None`` when the cache is disabled.
+            * ``engine_cache_size`` — number of per-tenant engines currently
+              cached (DATABASE isolation only), or ``None`` for other providers.
+            * ``metrics_enabled`` — mirrors ``config.enable_metrics``.
+
+        Example::
+
+            @app.get("/metrics")
+            async def metrics():
+                if not manager.config.enable_metrics:
+                    raise HTTPException(status_code=404)
+                return manager.get_metrics()
+        """
+        from fastapi_tenancy.isolation.database import (  # noqa: PLC0415
+            DatabaseIsolationProvider,
+        )
+
+        l1_stats: dict[str, Any] | None = None
+        if self._l1_cache is not None:
+            l1_stats = self._l1_cache.stats()
+
+        engine_cache_size: int | None = None
+        if isinstance(self.isolation_provider, DatabaseIsolationProvider):
+            engine_cache_size = self.isolation_provider._engine_cache.size
+
+        return {
+            "metrics_enabled": self.config.enable_metrics,
+            "l1_cache": l1_stats,
+            "engine_cache_size": engine_cache_size,
+        }
 
 
 __all__ = ["AuditLogWriter", "TenancyManager"]

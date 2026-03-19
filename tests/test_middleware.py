@@ -228,7 +228,7 @@ class TestResolutionErrors:
         assert "detail" in resp.json()
 
     @pytest.mark.asyncio
-    async def test_tenant_not_found_returns_404(self) -> None:
+    async def test_tenant_not_found_returns_400(self) -> None:
         manager = await _build_manager(_tenant("known-tenant"))
         app = _make_fastapi_app(manager)
 
@@ -239,7 +239,7 @@ class TestResolutionErrors:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.get("/test", headers={"X-Tenant-ID": "unknown-tenant"})
 
-        assert resp.status_code == 404
+        assert resp.status_code == 400
         assert resp.json()["detail"] == "Tenant not found"
 
     @pytest.mark.asyncio

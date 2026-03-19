@@ -213,6 +213,9 @@ class SchemaIsolationProvider(BaseIsolationProvider):
             assert self._mysql_delegate is not None
             async with self._mysql_delegate.get_session(tenant) as session:
                 yield session
+        elif self.dialect == DbDialect.MSSQL:
+            async with self._mssql_schema_session(tenant) as session:
+                yield session
         elif supports_native_schemas(self.dialect):
             async with self._schema_session(tenant) as session:
                 yield session
@@ -245,6 +248,18 @@ class SchemaIsolationProvider(BaseIsolationProvider):
         validates *schema* contains only safe characters, it is safe to
         interpolate as a literal.
 
+        SQLAlchemy 2.0 note
+        -------------------
+        ``session.connection()`` implicitly starts a transaction, which means
+        any subsequent ``async with session.begin()`` in the route handler
+        would raise ``InvalidRequestError: A transaction is already begun``.
+        To avoid this we register the event listener on the *checkout* event
+        of the engine's sync connection pool instead.  The ``checkout`` event
+        fires each time a connection is retrieved from the pool, before the
+        session starts a transaction, so we can safely call
+        ``exec_driver_sql`` there and then call ``SET LOCAL`` again at the
+        start of every subsequent transaction via the ``begin`` listener.
+
         Args:
             tenant: Currently active tenant.
 
@@ -261,20 +276,21 @@ class SchemaIsolationProvider(BaseIsolationProvider):
         # lowercase letters, digits, and underscores — safe to interpolate.
         set_path_sql = f'SET LOCAL search_path TO "{schema}", public'
 
+        # Install the begin-event listener on the sync engine's connection pool
+        # so it fires BEFORE any transaction is started on the connection.
+        # This avoids the "A transaction is already begun" error that occurs
+        # when session.connection() is called first (which starts an implicit
+        # transaction) and then the caller opens session.begin().
+        def _on_begin(sync_connection: Any) -> None:
+            sync_connection.exec_driver_sql(set_path_sql)
+
+        sync_engine = self.engine.sync_engine
+        event.listen(sync_engine, "begin", _on_begin)
+
         async with AsyncSession(self.engine, expire_on_commit=False) as session:
             try:
-                # Install a connection-level listener so search_path is
-                # re-applied at the start of every transaction, not just the
-                # first one.  This is essential when the route handler opens
-                # its own session.begin() block after the session is yielded.
-                conn = await session.connection()
-                sync_conn = conn.sync_connection
-
-                @event.listens_for(sync_conn, "begin")
-                def _set_search_path(sync_connection) -> None:  # type: ignore[no-untyped-def]  # noqa: ANN001
-                    sync_connection.exec_driver_sql(set_path_sql)
-
-                # Apply immediately for the first (implicit) transaction.
+                # Apply search_path immediately for the first transaction so
+                # the session is isolated from the moment it is yielded.
                 await session.execute(text(set_path_sql))
                 logger.debug("search_path → %r (tenant %s)", schema, tenant.id)
                 yield session
@@ -287,6 +303,65 @@ class SchemaIsolationProvider(BaseIsolationProvider):
                     tenant_id=tenant.id,
                     details={"schema": schema, "error": str(exc)},
                 ) from exc
+            finally:
+                # Always remove the listener so it doesn't fire for other
+                # sessions or tenants that reuse connections from this pool.
+                event.remove(sync_engine, "begin", _on_begin)
+
+    @asynccontextmanager
+    async def _mssql_schema_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
+        """Yield a session scoped to the tenant's MSSQL schema.
+
+        Why not ``ALTER USER … WITH DEFAULT_SCHEMA``
+        ---------------------------------------------
+        ``ALTER USER`` changes the *persistent* default schema of a database
+        principal.  It is forbidden for the ``dbo`` user (error 15150), which
+        is exactly the principal that the ``sa`` login — the standard
+        development/container login — resolves to.  Any production deployment
+        using a high-privilege login will hit the same restriction.
+
+        Correct approach — schema translation map
+        ------------------------------------------
+        SQLAlchemy 2.0 supports per-execution schema translation via
+        ``execution_options(schema_translate_map={None: schema})``.  This
+        instructs the ORM/Core layer to rewrite every unqualified table
+        reference (schema=None) to ``[schema].[table]`` at SQL-generation time,
+        without issuing any DDL against the database user.
+
+        The schema name is stored in ``session.info["schema"]`` so that route
+        handlers can also build raw fully-qualified identifiers when they
+        bypass the ORM (e.g. ``sa.text(f"SELECT … FROM [{session.info['schema']}].[items]")``).
+
+        Args:
+            tenant: Currently active tenant.
+
+        Yields:
+            Configured :class:`~sqlalchemy.ext.asyncio.AsyncSession` with
+            ``schema_translate_map`` applied and ``session.info`` populated.
+
+        Raises:
+            IsolationError: When the session cannot be configured.
+        """
+        schema = self._validated_schema_name(tenant)
+
+        async with AsyncSession(self.engine, expire_on_commit=False) as session:
+            try:
+                # Apply schema translation so every unqualified ORM table
+                # reference becomes [schema].[table] in generated SQL.
+                await session.connection(execution_options={"schema_translate_map": {None: schema}})
+                session.info["schema"] = schema
+                session.info["tenant_id"] = tenant.id
+                logger.debug("MSSQL schema_translate_map → %r (tenant %s)", schema, tenant.id)
+                yield session
+            except IsolationError:
+                raise
+            except Exception as exc:
+                await session.rollback()
+                raise IsolationError(
+                    operation="get_session",
+                    tenant_id=tenant.id,
+                    details={"schema": schema, "dialect": "mssql", "error": str(exc)},
+                ) from exc
 
     @asynccontextmanager
     async def _prefix_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
@@ -296,11 +371,27 @@ class SchemaIsolationProvider(BaseIsolationProvider):
         Route handlers use ``session.info["table_prefix"]`` to select the
         correct prefixed table name.
 
+        .. warning:: Multi-transaction sessions
+            Unlike the schema/RLS session methods, this method does **not**
+            install a connection-level ``begin`` event listener because there
+            is no SQL command to re-apply — the prefix is stored in
+            ``session.info``, which persists for the lifetime of the session
+            object regardless of how many transactions are opened.
+
+            However, if your route handler creates a *new* ``AsyncSession``
+            instance manually (rather than using the one yielded here), it
+            will **not** have ``session.info["table_prefix"]`` set.  Always
+            use the session yielded by this context manager, or set
+            ``session.info["table_prefix"]`` explicitly on any manually
+            created session.
+
         Args:
             tenant: Currently active tenant.
 
         Yields:
-            Configured :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
+            Configured :class:`~sqlalchemy.ext.asyncio.AsyncSession` with
+            ``session.info["tenant_id"]`` and ``session.info["table_prefix"]``
+            populated.
 
         Raises:
             IsolationError: When the session cannot be opened.
@@ -368,10 +459,96 @@ class SchemaIsolationProvider(BaseIsolationProvider):
             await self._mysql_delegate.initialize_tenant(tenant, metadata=metadata)
             return
 
-        if supports_native_schemas(self.dialect):
+        if self.dialect == DbDialect.MSSQL:
+            await self._initialize_mssql_schema(tenant, metadata)
+        elif supports_native_schemas(self.dialect):
             await self._initialize_schema(tenant, metadata)
         else:
             await self._initialize_prefix(tenant, metadata)
+
+    async def _initialize_mssql_schema(
+        self,
+        tenant: Tenant,
+        metadata: MetaData | None,
+    ) -> None:
+        """Create a schema on MSSQL and optionally create tables inside it.
+
+        MSSQL uses ``CREATE SCHEMA`` for namespace creation (same DDL syntax as
+        PostgreSQL) but ``ALTER USER … WITH DEFAULT_SCHEMA`` is forbidden for
+        the ``dbo`` user (error 15150) — the principal that ``sa`` resolves to.
+
+        Tables are created by binding ``metadata`` to a schema-qualified
+        ``MetaData`` copy so SQLAlchemy generates ``CREATE TABLE [schema].[table]``
+        without requiring any changes to the database user's default schema.
+
+        Args:
+            tenant: Target tenant.
+            metadata: Optional SQLAlchemy ``MetaData`` for table creation.
+
+        Raises:
+            IsolationError: When schema creation fails.
+        """
+        import sqlalchemy as sa  # noqa: PLC0415
+
+        schema = self._validated_schema_name(tenant)
+        assert_safe_schema_name(schema, context=f"initialize_tenant tenant={tenant.id!r}")
+
+        async with self.engine.begin() as conn:
+            try:
+                # MSSQL does not support IF NOT EXISTS on CREATE SCHEMA —
+                # check existence first to make this idempotent.
+                result = await conn.execute(
+                    text(
+                        "SELECT schema_name FROM information_schema.schemata "
+                        "WHERE schema_name = :name"
+                    ),
+                    {"name": schema},
+                )
+                if result.scalar() is not None:
+                    logger.warning("MSSQL schema %r already exists — skipping CREATE", schema)
+                else:
+                    # CREATE SCHEMA must be the only statement in a batch on MSSQL.
+                    await conn.execute(text(f"CREATE SCHEMA [{schema}]"))
+                    logger.info("Created MSSQL schema %r for tenant %s", schema, tenant.id)
+
+                if metadata is not None:
+                    # Build a schema-qualified MetaData copy so SQLAlchemy
+                    # generates "CREATE TABLE [schema].[table]" without
+                    # requiring ALTER USER (which is forbidden for dbo).
+                    qualified_meta = sa.MetaData(schema=schema)
+                    for table in metadata.sorted_tables:
+                        table.to_metadata(qualified_meta)
+                    await conn.run_sync(qualified_meta.create_all)
+                    logger.info("Created tables in MSSQL schema %r", schema)
+            except IsolationError:
+                raise
+            except Exception as exc:
+                try:  # noqa: SIM105
+                    await conn.rollback()
+                except Exception:  # pragma: no cover  # noqa: S110
+                    pass
+                async with self.engine.connect() as cleanup_conn:
+                    try:
+                        await cleanup_conn.execute(text(f"DROP SCHEMA [{schema}]"))
+                        await cleanup_conn.commit()
+                        logger.warning(
+                            "Rolled back MSSQL schema %r after failed initialize_tenant "
+                            "for tenant %s",
+                            schema,
+                            tenant.id,
+                        )
+                    except Exception as cleanup_exc:
+                        logger.exception(
+                            "MSSQL schema cleanup failed for %r (tenant %s): %s",
+                            schema,
+                            tenant.id,
+                            cleanup_exc,  # noqa: TRY401
+                        )
+                raise IsolationError(
+                    operation="initialize_tenant",
+                    tenant_id=tenant.id,
+                    details={"schema": schema, "dialect": "mssql", "error": str(exc)},
+                ) from exc
 
     async def _initialize_schema(
         self,
@@ -569,7 +746,31 @@ class SchemaIsolationProvider(BaseIsolationProvider):
             await self._mysql_delegate.destroy_tenant(tenant)
             return
 
-        if supports_native_schemas(self.dialect):
+        if self.dialect == DbDialect.MSSQL:
+            schema = self._validated_schema_name(tenant)
+            assert_safe_schema_name(schema, context=f"destroy_tenant tenant={tenant.id!r}")
+            async with self.engine.begin() as conn:
+                try:
+                    # MSSQL uses bracket quoting; no IF EXISTS on DROP SCHEMA in older versions.
+                    # Tables inside the schema must be dropped first.
+                    await conn.execute(
+                        text(
+                            "DECLARE @sql NVARCHAR(MAX) = '';"
+                            "SELECT @sql = @sql + 'DROP TABLE [' + :schema + '].[' + TABLE_NAME + '];' "  # noqa: E501
+                            "FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :schema;"
+                            "EXEC sp_executesql @sql"
+                        ),
+                        {"schema": schema},
+                    )
+                    await conn.execute(text(f"DROP SCHEMA [{schema}]"))
+                    logger.warning("Destroyed MSSQL schema %r for tenant %s", schema, tenant.id)
+                except Exception as exc:
+                    raise IsolationError(
+                        operation="destroy_tenant",
+                        tenant_id=tenant.id,
+                        details={"schema": schema, "dialect": "mssql", "error": str(exc)},
+                    ) from exc
+        elif supports_native_schemas(self.dialect):
             schema = self._validated_schema_name(tenant)
             assert_safe_schema_name(schema, context=f"destroy_tenant tenant={tenant.id!r}")
             async with self.engine.begin() as conn:

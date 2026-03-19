@@ -803,12 +803,21 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
         escaped = query.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         async with self._session_factory() as session, session.begin():
+            # MSSQL does not support ILIKE — use LIKE instead.  MSSQL's LIKE is
+            # case-insensitive by default when the column collation is CI (the
+            # common default), which gives the same practical behaviour.
+            # All other dialects use ILIKE for explicit case-insensitive matching.
+            if self._dialect == DbDialect.MSSQL:
+                where_clause = TenantModel.identifier.like(
+                    pattern, escape="\\"
+                ) | TenantModel.name.like(pattern, escape="\\")
+            else:
+                where_clause = TenantModel.identifier.ilike(
+                    pattern, escape="\\"
+                ) | TenantModel.name.ilike(pattern, escape="\\")
             result = await session.execute(
                 select(TenantModel)
-                .where(
-                    TenantModel.identifier.ilike(pattern, escape="\\")
-                    | TenantModel.name.ilike(pattern, escape="\\")
-                )
+                .where(where_clause)
                 .order_by(TenantModel.identifier)
                 .limit(limit)
             )

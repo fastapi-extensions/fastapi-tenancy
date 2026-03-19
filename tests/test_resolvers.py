@@ -92,14 +92,14 @@ class TestHeaderTenantResolver:
         request = _make_request(headers={})
         with pytest.raises(TenantResolutionError) as exc_info:
             await resolver.resolve(request)
-        assert "X-Tenant-ID" in exc_info.value.reason
+        assert exc_info.value.reason == "Tenant not found"
 
     async def test_empty_header_raises_resolution_error(self, store: InMemoryTenantStore) -> None:
         resolver = HeaderTenantResolver(store)
         request = _make_request(headers={"X-Tenant-ID": ""})
         with pytest.raises(TenantResolutionError) as exc_info:
             await resolver.resolve(request)
-        assert "missing or empty" in exc_info.value.reason.lower()
+        assert exc_info.value.reason == "Tenant not found"
 
     async def test_whitespace_only_header_raises(self, store: InMemoryTenantStore) -> None:
         resolver = HeaderTenantResolver(store)
@@ -115,13 +115,14 @@ class TestHeaderTenantResolver:
         request = _make_request(headers={"X-Tenant-ID": "INVALID!!!"})
         with pytest.raises(TenantResolutionError) as exc_info:
             await resolver.resolve(request)
-        assert "invalid" in exc_info.value.reason.lower()
+        assert exc_info.value.reason == "Tenant not found"
 
-    async def test_unknown_tenant_raises_not_found(self, store: InMemoryTenantStore) -> None:
+    async def test_unknown_tenant_raises_resolution_error(self, store: InMemoryTenantStore) -> None:
         resolver = HeaderTenantResolver(store)
         request = _make_request(headers={"X-Tenant-ID": "nonexistent-co"})
-        with pytest.raises(TenantNotFoundError):
+        with pytest.raises(TenantResolutionError) as exc_info:
             await resolver.resolve(request)
+        assert exc_info.value.reason == "Tenant not found"
 
     async def test_case_insensitive_header_name(self, store: InMemoryTenantStore) -> None:
         resolver = HeaderTenantResolver(store)

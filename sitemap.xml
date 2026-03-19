@@ -2,222 +2,222 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/cache/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/config/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/context/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/dependencies/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/exceptions/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/isolation/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/manager/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/middleware/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/migrations/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/resolution/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/storage/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/api/types/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/contributing/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/contributing/setup/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/contributing/style/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/contributing/testing/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/getting-started/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/getting-started/configuration/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/getting-started/installation/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/getting-started/quickstart/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/audit-logging/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/caching/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/context/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/dependencies/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/deployment/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/middleware/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/migrations/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/rate-limiting/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/testing/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/isolation/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/isolation/database/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/isolation/hybrid/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/isolation/rls/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/isolation/schema/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/custom/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/header/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/jwt/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/path/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/resolution/subdomain/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/storage/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/storage/custom/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/storage/memory/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/storage/redis/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/guides/storage/sqlalchemy/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/changelog/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/config-fields/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/env-vars/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/exceptions/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/glossary-page/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
     <url>
          <loc>https://fastapi-tenancy.readthedocs.io/reference/glossary/</loc>
-         <lastmod>2026-03-06</lastmod>
+         <lastmod>2026-03-19</lastmod>
     </url>
 </urlset>

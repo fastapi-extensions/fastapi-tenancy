@@ -19,7 +19,7 @@
 #   ?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes                  #
 #                                                                                     #
 # REDIS_URL                                                                           #
-#   redis://localhost:6379/0                                                           #
+#   redis://localhost:6379/0                                                          #
 #######################################################################################
 
 services:

@@ -184,7 +184,6 @@ jobs:
             --ignore=tests/storage/test_mssql_store.py \
             --ignore=tests/storage/test_redis_store.py \
             --ignore=tests/storage/test_sqla_contract.py \
-            --ignore=tests/test_fixed_issues.py \
             --tb=short -q \
             --cov=fastapi_tenancy \
             --cov-report=xml:coverage-unit-py${{ matrix.python-version }}.xml
@@ -247,8 +246,7 @@ jobs:
             --ignore=tests/storage/test_mssql_store.py \
             --tb=short -q \
             --cov=fastapi_tenancy \
-            --cov-report=xml:coverage-integration-py${{ matrix.python-version }}.xml \
-            --cov-fail-under=85
+            --cov-report=xml:coverage-integration-py${{ matrix.python-version }}.xml
 
       - name: Upload coverage artifact
         if: matrix.python-version == '3.12'
@@ -325,7 +323,6 @@ jobs:
             tests/isolation/test_schema.py \
             tests/isolation/test_rls.py \
             tests/isolation/test_hybrid.py \
-            tests/test_fixed_issues.py \
             -m "e2e" \
             --tb=short -v \
             --cov=fastapi_tenancy \

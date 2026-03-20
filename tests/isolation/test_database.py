@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import sqlalchemy as sa
@@ -421,3 +421,95 @@ class TestPostgresDatabaseProvider:
     ) -> None:
         t = make_tenant(identifier="pg-never-existed-db")
         assert await pg_database_provider.verify_isolation(t) is False
+
+
+@pytest.mark.integration
+class TestCreationLocksLeak:
+    """FIX: _creation_locks must be cleaned up even when engine creation fails."""
+
+    async def test_lock_removed_after_successful_creation(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = make_tenant(identifier="lock-ok")
+        try:
+            await provider._get_engine(tenant)
+            assert tenant.id not in provider._creation_locks
+        finally:
+            await provider.close()
+
+    async def test_lock_removed_on_engine_creation_failure(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = make_tenant(identifier="lock-fail")
+        with (
+            patch(
+                "fastapi_tenancy.isolation.database.create_async_engine",
+                side_effect=RuntimeError("simulated failure"),
+            ),
+            pytest.raises(RuntimeError, match="simulated failure"),
+        ):
+            await provider._get_engine(tenant)
+        assert tenant.id not in provider._creation_locks
+        await provider.close()
+
+    async def test_repeated_attempt_after_failure_succeeds(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = make_tenant(identifier="lock-retry")
+        call_count = 0
+        real_create = create_async_engine
+
+        def _failing_then_ok(url: str, **kw: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("first attempt fails")
+            return real_create(url, **kw)
+
+        with patch("fastapi_tenancy.isolation.database.create_async_engine", _failing_then_ok):
+            with pytest.raises(RuntimeError):
+                await provider._get_engine(tenant)
+            engine = await provider._get_engine(tenant)
+            assert engine is not None
+        await provider.close()
+
+
+@pytest.mark.integration
+class TestConcurrentEngineCreation:
+    """FIX: 50 concurrent coroutines for the same tenant must produce exactly one engine."""
+
+    async def test_exactly_one_engine_created_under_concurrency(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = make_tenant(identifier="concurrent-tenant")
+        creation_count = 0
+        real_create = create_async_engine
+
+        def _counting_create(url: str, **kw: Any) -> Any:
+            nonlocal creation_count
+            creation_count += 1
+            return real_create(url, **kw)
+
+        with patch("fastapi_tenancy.isolation.database.create_async_engine", _counting_create):
+            engines = await asyncio.gather(*[provider._get_engine(tenant) for _ in range(50)])
+
+        assert len({id(e) for e in engines}) == 1, "Multiple engine objects returned"
+        assert creation_count == 1, f"Expected 1 creation, got {creation_count}"
+        assert tenant.id not in provider._creation_locks
+        await provider.close()
+
+    async def test_concurrent_different_tenants_each_get_own_engine(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenants = [make_tenant(identifier=f"multi-{i}") for i in range(10)]
+        engines = await asyncio.gather(*[provider._get_engine(t) for t in tenants])
+        assert len({id(e) for e in engines}) == 10
+        await provider.close()

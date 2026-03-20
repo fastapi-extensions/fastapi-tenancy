@@ -465,3 +465,71 @@ class TestBaseTenantResolver:
 
         resolver = Concrete(store)
         assert resolver.store is store
+
+
+class TestHeaderResolverEnumeration:
+    """FIX: Missing header, invalid format, and unknown tenant all return the same reason."""
+
+    def _make_request(self, headers: dict[str, str]) -> Any:
+        from starlette.requests import Request  # noqa: PLC0415
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            "query_string": b"",
+        }
+        return Request(scope)
+
+    async def test_missing_header_raises_resolution_error(self) -> None:
+        store = InMemoryTenantStore()
+        resolver = HeaderTenantResolver(store)
+        request = _make_request(headers={})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert exc_info.value.reason == "Tenant not found"
+
+    async def test_invalid_identifier_raises_resolution_error(self) -> None:
+        store = InMemoryTenantStore()
+        resolver = HeaderTenantResolver(store)
+        request = _make_request(headers={"X-Tenant-ID": "INVALID TENANT!!!"})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert exc_info.value.reason == "Tenant not found"
+
+    async def test_unknown_tenant_raises_resolution_error(self) -> None:
+        store = InMemoryTenantStore()
+        resolver = HeaderTenantResolver(store)
+        request = _make_request(headers={"X-Tenant-ID": "valid-but-unknown"})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert exc_info.value.reason == "Tenant not found"
+
+    async def test_all_failure_modes_indistinguishable(self) -> None:
+        """Missing header, invalid format and unknown tenant all produce the same reason."""
+        store = InMemoryTenantStore()
+        resolver = HeaderTenantResolver(store)
+
+        reasons = []
+        for headers in [
+            {},
+            {"X-Tenant-ID": ""},
+            {"X-Tenant-ID": "BAD IDENTIFIER!!!"},
+            {"X-Tenant-ID": "unknown-tenant-xyz"},
+        ]:
+            request = _make_request(headers)
+            with pytest.raises(TenantResolutionError) as exc_info:
+                await resolver.resolve(request)
+            reasons.append(exc_info.value.reason)
+
+        assert len(set(reasons)) == 1, f"Expected all same reason, got: {reasons}"
+
+    async def test_valid_tenant_resolves_successfully(self) -> None:
+        store = InMemoryTenantStore()
+        tenant = _make_tenant(identifier="known-tenant")
+        await store.create(tenant)
+        resolver = HeaderTenantResolver(store)
+        request = _make_request(headers={"X-Tenant-ID": "known-tenant"})
+        resolved = await resolver.resolve(request)
+        assert resolved.identifier == "known-tenant"

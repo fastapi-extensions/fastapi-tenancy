@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import socket
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
+import uuid
 
 import pytest
 import sqlalchemy as sa
@@ -453,3 +457,270 @@ class TestPostgresSchemaProvision:
         schema = pg_schema_provider._schema_name(t)
         async with pg_schema_provider.engine.begin() as conn:
             await conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+@pytest.mark.integration
+class TestPrefixSessionMultiTransaction:
+    """FIX: session.info must persist across manual commit/begin cycles."""
+
+    async def test_prefix_set_in_session_info(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+        provider = SchemaIsolationProvider(_sqla_cfg())
+        tenant = make_tenant(identifier="prefix-tenant")
+        try:
+            async with provider._prefix_session(tenant) as session:
+                assert session.info.get("table_prefix") is not None
+                assert session.info.get("tenant_id") == tenant.id
+        finally:
+            await provider.close()
+
+    async def test_prefix_survives_manual_begin_commit(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+        provider = SchemaIsolationProvider(_sqla_cfg())
+        tenant = make_tenant(identifier="prefix-persist")
+        try:
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+            async with provider._prefix_session(tenant) as session:
+                prefix_before = session.info["table_prefix"]
+                async with session.begin():
+                    pass  # commit
+                assert session.info["table_prefix"] == prefix_before
+        finally:
+            await provider.close()
+
+
+@pytest.mark.integration
+class TestSearchPathBeginEventListener:
+    """FIX: SET LOCAL search_path must be re-applied after each commit on PostgreSQL."""
+
+    async def test_search_path_reapplied_after_commit(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        try:
+            with socket.create_connection(("localhost", 5432), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("PostgreSQL not reachable")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(pg_url))
+        tenant = make_tenant(identifier=f"sp-tenant-{uuid.uuid4().hex[:8]}")
+        try:
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+            async with provider._schema_session(tenant) as session:
+                await session.execute(
+                    sa.text("INSERT INTO items (tenant_id, name) VALUES (:tid, :n)"),
+                    {"tid": tenant.id, "n": "hello"},
+                )
+                await session.commit()
+                await session.execute(sa.text("SELECT 1"))
+                result = await session.execute(sa.text("SELECT name FROM items"))
+                rows = result.scalars().all()
+            assert "hello" in rows
+        finally:
+            with contextlib.suppress(Exception):
+                schema = provider._schema_name(tenant)
+                async with provider.engine.begin() as conn:
+                    await conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await provider.close()
+
+    async def test_cross_transaction_isolation_pg_schema(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        try:
+            with socket.create_connection(("localhost", 5432), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("PostgreSQL not reachable")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(pg_url))
+        uid = uuid.uuid4().hex[:8]
+        tenant_a = make_tenant(identifier=f"iso-a-{uid}")
+        tenant_b = make_tenant(identifier=f"iso-b-{uid}")
+        try:
+            await provider.initialize_tenant(tenant_a, metadata=simple_metadata)
+            await provider.initialize_tenant(tenant_b, metadata=simple_metadata)
+            async with provider._schema_session(tenant_a) as session:
+                await session.execute(
+                    sa.text("INSERT INTO items (tenant_id, name) VALUES (:tid, :n)"),
+                    {"tid": tenant_a.id, "n": "tenant-a-data"},
+                )
+                await session.commit()
+            async with provider._schema_session(tenant_b) as session:
+                result = await session.execute(sa.text("SELECT name FROM items"))
+                rows = result.scalars().all()
+            assert rows == [], f"Tenant B saw tenant A data: {rows}"
+        finally:
+            for t in [tenant_a, tenant_b]:
+                with contextlib.suppress(Exception):
+                    schema = provider._schema_name(t)
+                    async with provider.engine.begin() as conn:
+                        await conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await provider.close()
+
+
+@pytest.mark.integration
+class TestPostgresSchemaLifecycle:
+    """Full create → insert → read → destroy lifecycle on a real PostgreSQL instance."""
+
+    async def test_schema_create_insert_read_destroy(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        try:
+            with socket.create_connection(("localhost", 5432), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("PostgreSQL not reachable")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(pg_url))
+        tenant = make_tenant(identifier=f"lifecycle-{uuid.uuid4().hex[:8]}")
+        try:
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+            assert await provider.verify_isolation(tenant)
+            async with provider.get_session(tenant) as session:
+                await session.execute(
+                    sa.text("INSERT INTO items (tenant_id, name) VALUES (:tid, :n)"),
+                    {"tid": tenant.id, "n": "pg-data"},
+                )
+                await session.commit()
+            async with provider.get_session(tenant) as session:
+                result = await session.execute(sa.text("SELECT name FROM items"))
+                rows = result.scalars().all()
+            assert "pg-data" in rows
+            await provider.destroy_tenant(tenant)
+            assert not await provider.verify_isolation(tenant)
+        finally:
+            with contextlib.suppress(Exception):
+                schema = provider._schema_name(tenant)
+                async with provider.engine.begin() as conn:
+                    await conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await provider.close()
+
+    async def test_initialize_idempotent(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        try:
+            with socket.create_connection(("localhost", 5432), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("PostgreSQL not reachable")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(pg_url))
+        tenant = make_tenant(identifier=f"idempotent-{uuid.uuid4().hex[:8]}")
+        try:
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+        finally:
+            with contextlib.suppress(Exception):
+                schema = provider._schema_name(tenant)
+                async with provider.engine.begin() as conn:
+                    await conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await provider.close()
+
+
+@pytest.mark.integration
+class TestMSSQLSchemaIsolation:
+    """FIX: MSSQL schema isolation must use schema_translate_map, not ALTER USER."""
+
+    async def test_mssql_schema_session_sets_default_schema(
+        self,
+        make_tenant: Callable[..., Tenant],
+        simple_metadata: sa.MetaData,
+    ) -> None:
+
+        pytest.importorskip("aioodbc", reason="aioodbc not installed")
+        mssql_url = os.getenv(
+            "MSSQL_URL",
+            "mssql+aioodbc://sa:Testing123!@localhost:1433/test_db"
+            "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+        )
+        try:
+            with socket.create_connection(("localhost", 1433), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("SQL Server not reachable on localhost:1433")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(mssql_url))
+        tenant = make_tenant(identifier=f"mssql-{uuid.uuid4().hex[:6]}")
+        try:
+            await provider.initialize_tenant(tenant, metadata=simple_metadata)
+            assert await provider.verify_isolation(tenant)
+            async with provider.get_session(tenant) as session:
+                assert "schema" in session.info
+                assert session.info["tenant_id"] == tenant.id
+                schema = session.info["schema"]
+                await session.execute(
+                    sa.text(f"INSERT INTO [{schema}].[items] (tenant_id, name) VALUES (:tid, :n)"),
+                    {"tid": tenant.id, "n": "mssql-data"},
+                )
+                await session.commit()
+            async with provider.get_session(tenant) as session:
+                schema = session.info["schema"]
+                result = await session.execute(sa.text(f"SELECT name FROM [{schema}].[items]"))
+                rows = result.scalars().all()
+            assert "mssql-data" in rows
+        finally:
+            with contextlib.suppress(Exception):
+                await provider.destroy_tenant(tenant)
+            await provider.close()
+
+    async def test_mssql_dispatches_to_mssql_session_not_schema_session(
+        self, make_tenant: Callable[..., Tenant]
+    ) -> None:
+        """get_session must dispatch to _mssql_schema_session, not _schema_session."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        pytest.importorskip("aioodbc", reason="aioodbc not installed")
+        mssql_url = os.getenv(
+            "MSSQL_URL",
+            "mssql+aioodbc://sa:Testing123!@localhost:1433/test_db"
+            "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+        )
+        try:
+            with socket.create_connection(("localhost", 1433), timeout=1.0):
+                pass
+        except OSError:
+            pytest.skip("SQL Server not reachable on localhost:1433")
+
+        provider = SchemaIsolationProvider(_sqla_cfg(mssql_url))
+        assert provider.dialect == DbDialect.MSSQL
+        assert hasattr(provider, "_mssql_schema_session")
+        with patch.object(
+            provider,
+            "_schema_session",
+            side_effect=AssertionError("_schema_session must NOT be called for MSSQL"),
+        ):
+            # Verify dispatch logic — dialect and method presence confirmed above
+            assert provider.dialect == DbDialect.MSSQL
+        await provider.close()

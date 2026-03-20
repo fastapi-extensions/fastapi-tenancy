@@ -88,7 +88,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Ruff lint
         run: uv run ruff check src tests
@@ -117,7 +117,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Mypy
         run: uv run mypy src tests
@@ -143,7 +143,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Bandit scan
         run: uv run bandit -r src/fastapi_tenancy -ll -ii
@@ -173,7 +173,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Run unit tests (no services)
         run: |
@@ -235,7 +235,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Run integration tests (SQLite + Redis)
         run: |
@@ -313,7 +313,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Run PostgreSQL E2E tests
         run: |
@@ -382,7 +382,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
 
       - name: Run MySQL E2E tests
         run: |
@@ -444,7 +444,7 @@ jobs:
 
       - name: Install docs dependencies
         run: |
-          uv sync --extra dev
+          uv sync --all-extras
           if [ -f requirements-docs.txt ]; then
             uv pip install -r requirements-docs.txt
           fi

@@ -518,7 +518,7 @@ class TestHeaderResolverEnumeration:
             {"X-Tenant-ID": "BAD IDENTIFIER!!!"},
             {"X-Tenant-ID": "unknown-tenant-xyz"},
         ]:
-            request = _make_request(headers)
+            request = _make_request(headers=headers)
             with pytest.raises(TenantResolutionError) as exc_info:
                 await resolver.resolve(request)
             reasons.append(exc_info.value.reason)

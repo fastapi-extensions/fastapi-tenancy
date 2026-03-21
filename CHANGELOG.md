@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] — 2026-03-20
+
+> Security hardening, field-level encryption, L1 cache wired into every request,
+> MSSQL schema isolation fix, anti-enumeration resolver, and a complete CI rewrite
+> with MSSQL in the integration tier.
+
+### Added
+
+**Field-level encryption (`utils/encryption.py`)**
+- `TenancyEncryption` — Fernet/HKDF-SHA256 implementation. Encrypts `database_url`
+  and any metadata key prefixed `_enc_` at rest. Ciphertext is prefixed `enc::` for
+  rolling-migration compatibility (plain values pass through unchanged on read).
+- Key material is derived via HKDF-SHA256 — callers supply any 32+ char passphrase;
+  the library derives a proper 32-byte Fernet key internally, preventing weak-key attacks.
+- `TenancyManager` encrypts on `register_tenant()` write and decrypts transparently
+  via `decrypt_tenant()`.
+
+**L1 cache wired into every request (`manager.py`)**
+- `_CachingStoreProxy` — transparent proxy that wraps any `TenantStore` with the
+  in-process `TenantCache`. Intercepts `get_by_identifier()` (the hot path on every
+  request) and serves from L1 on warm hits. Automatically invalidates on `create`,
+  `update`, `set_status`, and `delete`. Previously `TenantCache` existed but was
+  never connected to the request path.
+
+**Observability**
+- `TenancyManager.get_metrics()` — runtime snapshot: L1 cache hit rate / size,
+  engine cache size (DATABASE isolation). Designed for wiring to a `/metrics` endpoint.
+
+**CI / workflows**
+- MSSQL added to the **integration** job tier using the custom image from
+  `compose/mssql/` (built via `docker build` + `docker run` steps since GitHub
+  Actions `services:` does not support `build:` context). This is the same image
+  used by `make test-all` locally, ensuring parity between local and CI runs.
+- `ci.yml` — path-filtered job graph. Docs-only PRs skip all test/lint jobs.
+  Integration enforces `--cov-fail-under=85` which is achievable with MSSQL
+  included. E2E (PostgreSQL × 2 versions, MySQL) runs only on `main` push or
+  PRs labelled `run-e2e`.
+- `docs.yml` — separate workflow for MkDocs build + GitHub Pages deploy,
+  triggered only when docs paths change.
+- `release.yml` — version/CHANGELOG validation before build, pre-release detection
+  (→ TestPyPI), PyPI Trusted Publishing (OIDC — no stored API token).
+- `codeql.yml` — triggered only on `src/**` changes plus weekly schedule.
+- `dependency-review.yml` — blocks PRs introducing CVEs ≥ moderate or GPL/AGPL deps.
+- `ci-pass` gate job — single required status for branch protection.
+
+### Fixed
+
+**FIX-1 — `_creation_locks` leak on engine creation failure (`isolation/database.py`)**
+- `DatabaseIsolationProvider._get_engine()` — wrapped `create_async_engine()` in
+  `try/except`. On failure the per-tenant lock is removed from `_creation_locks`
+  before re-raising. Previously the lock leaked permanently, blocking all retries
+  for that tenant until process restart.
+
+**FIX-2 — MSSQL schema isolation (`isolation/schema.py`)**
+- `_mssql_schema_session()` — replaced `ALTER USER CURRENT_USER WITH DEFAULT_SCHEMA`
+  (permanently forbidden for the `dbo` principal, error 15150) with SQLAlchemy's
+  `schema_translate_map` execution option. Every unqualified ORM table reference is
+  rewritten to `[schema].[table]` at SQL-generation time with no DDL required.
+- `_initialize_mssql_schema()` — uses `MetaData(schema=schema)` + `create_all` to
+  generate `CREATE TABLE [schema].[table]` without touching any database user.
+- `get_session()` now has an explicit `elif self.dialect == DbDialect.MSSQL` branch.
+
+**FIX-3 — Tenant enumeration via header resolver (`resolution/header.py`)**
+- All failure modes — missing header, invalid identifier format, unknown tenant —
+  raise `TenantResolutionError` with the same generic reason `"Tenant not found"`.
+- Unknown tenant now produces a 400 response (not 404) to prevent status-code-based
+  enumeration of valid tenant identifiers.
+
+**FIX-4 — `search()` ILIKE not portable to MSSQL (`storage/database.py`)**
+- `SQLAlchemyTenantStore.search()` branches on `self._dialect`: MSSQL uses `.like()`
+  (case-insensitive by default with CI collation); all other dialects keep `.ilike()`.
+
+**FIX-5 — `_prefix_session` docstring gap (`isolation/schema.py`)**
+- Added `.. warning::` block documenting that `session.info["table_prefix"]` persists
+  on the session object across transactions but is not automatically set on new
+  `AsyncSession` instances created manually within the same request.
+
+**FIX-6 — `SET LOCAL search_path` implicit-transaction collision (`isolation/schema.py`)**
+- `_schema_session()` — replaced `session.connection()` (which starts an implicit
+  transaction, causing `InvalidRequestError: A transaction is already begun` when
+  callers open `async with session.begin()`) with an engine-level `begin` event
+  listener on `engine.sync_engine`. The listener fires before any transaction starts
+  and is removed in `finally` to prevent cross-session leakage.
+
+**FIX-7 — Flaky `test_multiple_requests_each_get_fresh_session` (`tests/test_dependencies.py`)**
+- Replaced `id(session)` comparison (unreliable: CPython reuses memory addresses for
+  non-overlapping objects) with `sessions_seen[0] is not sessions_seen[1]` while
+  keeping both references alive simultaneously.
+
+### Changed
+
+- **`AuditLogWriter` promoted to runtime `Protocol`** — moved out of `TYPE_CHECKING`,
+  decorated with `@runtime_checkable`. `isinstance(writer, AuditLogWriter)` now works
+  correctly at runtime.
+- **`enable_metrics` wired** — `TenancyManager.get_metrics()` exposes runtime metrics.
+  Previously the config field was declared but nothing consumed it.
+- **README** — complete rewrite with live CI and Codecov badges, feature table, all
+  four isolation strategies with code examples, encryption and L1 cache usage,
+  observability section, DB compatibility matrix.
+
+---
+
 ## [0.2.0] — 2026-02-06
 
 > First functional release. Version 0.1.0 was a scaffolding placeholder with no source code; all implementation work ships in this release.
@@ -82,5 +184,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[0.3.0]: https://github.com/fastapi-extensions/fastapi-tenancy/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fastapi-extensions/fastapi-tenancy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fastapi-extensions/fastapi-tenancy/releases/tag/v0.1.0

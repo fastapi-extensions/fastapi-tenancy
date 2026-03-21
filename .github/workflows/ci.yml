@@ -409,18 +409,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all coverage reports
+      - name: Download unit coverage
         uses: actions/download-artifact@v4
         with:
-          pattern: coverage-*
-          merge-multiple: true
+          name: coverage-unit
           path: coverage-reports/
+        continue-on-error: true
+
+      - name: Download integration coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-integration
+          path: coverage-reports/
+        continue-on-error: true
+
+      - name: List downloaded files
+        run: ls -la coverage-reports/ || echo "No coverage files found"
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
-          directory: coverage-reports/
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage-reports/coverage-unit-py3.12.xml,./coverage-reports/coverage-integration-py3.12.xml
+          flags: combined
+          name: fastapi-tenancy
           fail_ci_if_error: false
+          verbose: true
 
 # Docs build check
   docs-check:

@@ -11,7 +11,7 @@ Schema · Database · RLS · Hybrid isolation — fully async, fully typed
 [![PyPI version](https://img.shields.io/pypi/v/fastapi-tenancy?color=0A7AE2&logo=pypi&logoColor=white)](https://pypi.org/project/fastapi-tenancy/)
 [![Python](https://img.shields.io/pypi/pyversions/fastapi-tenancy?logo=python&logoColor=white)](https://pypi.org/project/fastapi-tenancy/)
 [![CI](https://github.com/fastapi-extensions/fastapi-tenancy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fastapi-extensions/fastapi-tenancy/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy/branch/main/graph/badge.svg)](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy)
+[![Coverage](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy/graph/badge.svg?token=a4f8805e-fb44-41f7-aa4c-df9b54ecc36f)](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy)
 [![Docs](https://img.shields.io/badge/docs-mkdocs-blue?logo=readthedocs&logoColor=white)](https://fastapi-tenancy.readthedocs.io)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e.svg)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)

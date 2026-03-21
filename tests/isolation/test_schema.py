@@ -463,9 +463,7 @@ class TestPostgresSchemaProvision:
 class TestPrefixSessionMultiTransaction:
     """FIX: session.info must persist across manual commit/begin cycles."""
 
-    async def test_prefix_set_in_session_info(
-        self, make_tenant: Callable[..., Tenant]
-    ) -> None:
+    async def test_prefix_set_in_session_info(self, make_tenant: Callable[..., Tenant]) -> None:
         provider = SchemaIsolationProvider(_sqla_cfg())
         tenant = make_tenant(identifier="prefix-tenant")
         try:

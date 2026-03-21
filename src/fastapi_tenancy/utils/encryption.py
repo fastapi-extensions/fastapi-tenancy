@@ -139,10 +139,6 @@ class TenancyEncryption:
         key = _derive_fernet_key(config.encryption_key)
         return cls(key)
 
-    # ------------------------------------------------------------------
-    # Low-level encrypt / decrypt
-    # ------------------------------------------------------------------
-
     def encrypt(self, plaintext: str) -> str:
         """Encrypt *plaintext* and return a prefixed ciphertext string.
 
@@ -194,10 +190,6 @@ class TenancyEncryption:
             ``True`` when the value starts with the encryption prefix.
         """
         return value.startswith(_ENCRYPTED_PREFIX)
-
-    # ------------------------------------------------------------------
-    # Tenant-level helpers
-    # ------------------------------------------------------------------
 
     def encrypt_tenant_fields(self, tenant: Any) -> Any:
         """Return a copy of *tenant* with sensitive fields encrypted.

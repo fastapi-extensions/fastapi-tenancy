@@ -10,7 +10,10 @@ from unittest.mock import patch
 import pytest
 
 from fastapi_tenancy.cache.tenant_cache import TenantCache
-from fastapi_tenancy.core.types import Tenant, TenantStatus
+from fastapi_tenancy.core.config import TenancyConfig
+from fastapi_tenancy.core.types import IsolationStrategy, ResolutionStrategy, Tenant, TenantStatus
+from fastapi_tenancy.manager import TenancyManager, _CachingStoreProxy
+from fastapi_tenancy.storage.memory import InMemoryTenantStore
 
 
 def _t(tid: str, identifier: str) -> Tenant:
@@ -235,3 +238,120 @@ class TestPurgeExpired:
         evicted = c.purge_expired()
         assert evicted == 0
         assert c.size() == 1
+
+
+@pytest.mark.integration
+class TestTenantCacheWiring:
+    """FIX: _CachingStoreProxy must intercept get_by_identifier on warm requests."""
+
+    async def test_caching_proxy_populates_cache_on_miss(self) -> None:
+        backing = InMemoryTenantStore()
+        l1 = TenantCache(max_size=100, ttl=60)
+        tenant = _t("t1", "proxy-tenant")
+        await backing.create(tenant)
+
+        proxy = _CachingStoreProxy(backing, l1)
+        result = await proxy.get_by_identifier("proxy-tenant")
+        assert result.identifier == "proxy-tenant"
+        # L1 should now be populated
+        assert l1.get_by_identifier("proxy-tenant") is not None
+
+    async def test_caching_proxy_serves_from_l1_on_second_call(self) -> None:
+        backing = InMemoryTenantStore()
+        l1 = TenantCache(max_size=100, ttl=60)
+        tenant = _t("t1", "l1-tenant")
+        await backing.create(tenant)
+
+        proxy = _CachingStoreProxy(backing, l1)
+        r1 = await proxy.get_by_identifier("l1-tenant")
+        r2 = await proxy.get_by_identifier("l1-tenant")
+        assert r1.identifier == r2.identifier == "l1-tenant"
+
+    async def test_l1_cache_invalidated_on_status_update(self) -> None:
+        cache = TenantCache(max_size=100, ttl=300)
+        tenant = _t("t1", "invalidate-me")
+        cache.set(tenant)
+        assert cache.get_by_identifier("invalidate-me") is not None
+        cache.invalidate(tenant.id)
+        assert cache.get_by_identifier("invalidate-me") is None
+
+    async def test_caching_proxy_invalidates_on_update(self) -> None:
+        backing = InMemoryTenantStore()
+        l1 = TenantCache(max_size=100, ttl=60)
+        tenant = _t("t1", "update-invalidate")
+        await backing.create(tenant)
+        proxy = _CachingStoreProxy(backing, l1)
+        await proxy.get_by_identifier("update-invalidate")
+        assert l1.get_by_identifier("update-invalidate") is not None
+
+        updated = tenant.model_copy(update={"name": "Updated Name"})
+        await proxy.update(updated)
+        assert l1.get_by_identifier("update-invalidate") is None
+
+    async def test_manager_l1_cache_wired_when_enabled(self) -> None:
+        """Manager with cache_enabled=True must expose a populated _l1_cache."""
+        cfg = TenancyConfig(
+            database_url="sqlite+aiosqlite:///:memory:",
+            resolution_strategy=ResolutionStrategy.HEADER,
+            isolation_strategy=IsolationStrategy.SCHEMA,
+            cache_enabled=True,
+            redis_url="redis://localhost:6379/0",
+        )
+        store = InMemoryTenantStore()
+        with patch("fastapi_tenancy.manager._build_resolver") as mock_build:
+            from fastapi_tenancy.resolution.header import HeaderTenantResolver  # noqa: PLC0415
+
+            mock_build.return_value = HeaderTenantResolver(store)
+            manager = TenancyManager(cfg, store)
+            await manager.initialize()
+        tenant = _t("t1", "cached-tenant")
+        await store.create(tenant)
+        try:
+            if manager._l1_cache is not None:
+                manager._l1_cache.set(tenant)
+                cached = manager._l1_cache.get_by_identifier("cached-tenant")
+                assert cached is not None
+                assert cached.identifier == "cached-tenant"
+        finally:
+            await manager.close()
+
+
+@pytest.mark.integration
+class TestCacheInvalidationOnWrite:
+    """FIX: _CachingStoreProxy must invalidate L1 on create/update/set_status/delete."""
+
+    def _proxy(self) -> tuple[_CachingStoreProxy, TenantCache, InMemoryTenantStore]:
+        backing = InMemoryTenantStore()
+        cache = TenantCache(max_size=100, ttl=300)
+        return _CachingStoreProxy(backing, cache), cache, backing
+
+    async def test_create_invalidates_stale_entry(self) -> None:
+        proxy, cache, _ = self._proxy()
+        tenant = _t("t1", "create-inv")
+        cache.set(tenant)
+        created = await proxy.create(tenant)
+        assert cache.get(created.id) is None
+
+    async def test_update_invalidates_cache(self) -> None:
+        proxy, cache, backing = self._proxy()
+        tenant = _t("t1", "update-inv")
+        await backing.create(tenant)
+        cache.set(tenant)
+        await proxy.update(tenant.model_copy(update={"name": "New Name"}))
+        assert cache.get(tenant.id) is None
+
+    async def test_set_status_invalidates_cache(self) -> None:
+        proxy, cache, backing = self._proxy()
+        tenant = _t("t1", "status-inv")
+        await backing.create(tenant)
+        cache.set(tenant)
+        await proxy.set_status(tenant.id, TenantStatus.SUSPENDED)
+        assert cache.get(tenant.id) is None
+
+    async def test_delete_invalidates_cache(self) -> None:
+        proxy, cache, backing = self._proxy()
+        tenant = _t("t1", "delete-inv")
+        await backing.create(tenant)
+        cache.set(tenant)
+        await proxy.delete(tenant.id)
+        assert cache.get(tenant.id) is None

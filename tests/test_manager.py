@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import pytest
 
 from fastapi_tenancy.core.config import TenancyConfig
@@ -24,12 +27,27 @@ from fastapi_tenancy.core.types import (
     TenantStatus,
 )
 from fastapi_tenancy.manager import (
+    AuditLogWriter,
     TenancyManager,
     _build_provider,
     _build_resolver,
     _DefaultAuditLogWriter,
 )
+from fastapi_tenancy.storage.database import SQLAlchemyTenantStore
 from fastapi_tenancy.storage.memory import InMemoryTenantStore
+from fastapi_tenancy.utils.encryption import TenancyEncryption
+
+
+def _derive_key(raw: str) -> bytes:
+    return base64.urlsafe_b64encode(
+        HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"fastapi-tenancy-v1").derive(
+            raw.encode()
+        )
+    )
+
+
+_ENC_KEY = "test-encryption-key-exactly-32ch"
+_SQLITE = "sqlite+aiosqlite:///:memory:"
 
 
 def _cfg(**kw: Any) -> TenancyConfig:
@@ -569,3 +587,152 @@ class TestManagerIntegration:
             await store.get_by_id(tenant.id)
 
         await m.close()
+
+
+@pytest.mark.unit
+class TestEncryption:
+    """FIX: TenancyEncryption must encrypt on write and decrypt on read."""
+
+    def test_encrypt_decrypt_roundtrip(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        plaintext = "postgresql+asyncpg://user:secret@host/db"
+        ciphertext = enc.encrypt(plaintext)
+        assert ciphertext.startswith("enc::")
+        assert enc.decrypt(ciphertext) == plaintext
+
+    def test_encrypt_already_encrypted_is_noop(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        ct = enc.encrypt("hello")
+        assert enc.encrypt(ct) == ct
+
+    def test_decrypt_plain_passthrough(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        assert enc.decrypt("not-encrypted") == "not-encrypted"
+
+    def test_from_config_none_when_disabled(self) -> None:
+        assert TenancyEncryption.from_config(_cfg()) is None
+
+    def test_from_config_returns_instance_when_enabled(self) -> None:
+        cfg = _cfg(enable_encryption=True, encryption_key=_ENC_KEY)
+        assert TenancyEncryption.from_config(cfg) is not None
+
+    def test_encrypt_tenant_database_url(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        t = _tenant()
+        t2 = t.model_copy(update={"database_url": "postgresql+asyncpg://u:p@h/db"})
+        encrypted = enc.encrypt_tenant_fields(t2)
+        assert encrypted.database_url is not None
+        assert encrypted.database_url.startswith("enc::")
+
+    def test_encrypt_enc_prefixed_metadata_key(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        t = _tenant()
+        t2 = t.model_copy(update={"metadata": {"_enc_api_key": "secret", "plan": "pro"}})
+        encrypted = enc.encrypt_tenant_fields(t2)
+        assert encrypted.metadata["_enc_api_key"].startswith("enc::")
+        assert encrypted.metadata["plan"] == "pro"
+
+    def test_decrypt_tenant_fields_roundtrip(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        t = _tenant()
+        t2 = t.model_copy(
+            update={
+                "database_url": "postgresql+asyncpg://u:pass@h/db",
+                "metadata": {"_enc_secret": "my-secret", "visible": "ok"},
+            }
+        )
+        decrypted = enc.decrypt_tenant_fields(enc.encrypt_tenant_fields(t2))
+        assert decrypted.database_url == t2.database_url
+        assert decrypted.metadata["_enc_secret"] == "my-secret"
+        assert decrypted.metadata["visible"] == "ok"
+
+    async def test_manager_encrypts_on_register_decrypts_on_read(self) -> None:
+        cfg = _cfg(enable_encryption=True, encryption_key=_ENC_KEY)
+        store = SQLAlchemyTenantStore(_SQLITE)
+        await store.initialize()
+        manager = TenancyManager(cfg, store)
+        await manager.initialize()
+        try:
+            manager.isolation_provider.initialize_tenant = AsyncMock()  # type: ignore[method-assign]
+            created = await manager.register_tenant(
+                "enc-tenant",
+                "Enc Tenant",
+                metadata={"_enc_api_key": "top-secret", "plan": "enterprise"},
+            )
+            raw = await store.get_by_identifier(created.identifier)
+            assert raw.metadata["_enc_api_key"].startswith("enc::")
+            assert raw.metadata["plan"] == "enterprise"
+            plain = manager.decrypt_tenant(raw)
+            assert plain.metadata["_enc_api_key"] == "top-secret"
+        finally:
+            await manager.close()
+            await store.close()
+
+
+@pytest.mark.unit
+class TestAuditLogWriterRuntime:
+    """FIX: AuditLogWriter must be usable at runtime, not only under TYPE_CHECKING."""
+
+    def test_importable_at_runtime(self) -> None:
+        assert AuditLogWriter is not None
+
+    def test_has_write_method(self) -> None:
+        assert hasattr(AuditLogWriter, "write")
+
+    def test_custom_writer_satisfies_protocol(self) -> None:
+        class MyWriter:
+            async def write(self, entry: Any) -> None:
+                pass
+
+        assert isinstance(MyWriter(), AuditLogWriter)
+
+    def test_object_without_write_fails_protocol(self) -> None:
+        class NotAWriter:
+            pass
+
+        assert not isinstance(NotAWriter(), AuditLogWriter)
+
+
+@pytest.mark.unit
+class TestGetMetrics:
+    """FIX: get_metrics() must return L1 cache stats and engine cache size."""
+
+    async def test_metrics_no_cache(self) -> None:
+        manager = TenancyManager(_cfg(), InMemoryTenantStore())
+        await manager.initialize()
+        try:
+            m = manager.get_metrics()
+            assert m["l1_cache"] is None
+        finally:
+            await manager.close()
+
+    async def test_metrics_engine_cache_size_database_isolation(self) -> None:
+        cfg = _cfg(
+            isolation_strategy=IsolationStrategy.DATABASE,
+            database_url_template="sqlite+aiosqlite:///./fi_mgr_{database_name}.db",
+        )
+        manager = TenancyManager(cfg, InMemoryTenantStore())
+        await manager.initialize()
+        try:
+            m = manager.get_metrics()
+            assert "engine_cache_size" in m
+            assert m["engine_cache_size"] == 0
+        finally:
+            await manager.close()
+
+    async def test_metrics_engine_cache_grows_after_init(self) -> None:
+        cfg = _cfg(
+            isolation_strategy=IsolationStrategy.DATABASE,
+            database_url_template="sqlite+aiosqlite:///./fi_mgr_{database_name}.db",
+        )
+        store = InMemoryTenantStore()
+        manager = TenancyManager(cfg, store)
+        await manager.initialize()
+        t = _tenant(identifier="metrics-tenant")
+        await store.create(t)
+        try:
+            await manager.isolation_provider.initialize_tenant(t)
+            m = manager.get_metrics()
+            assert m["engine_cache_size"] == 1
+        finally:
+            await manager.close()

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import os
+import socket
 from typing import TYPE_CHECKING
+import uuid
 
 import pytest
 from sqlalchemy import text
@@ -15,6 +18,14 @@ from fastapi_tenancy.utils.db_compat import DbDialect
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _pg_up() -> bool:
+    try:
+        with socket.create_connection(("localhost", 5432), timeout=1.0):
+            return True
+    except OSError:
+        return False
 
 
 @pytest.mark.integration
@@ -159,3 +170,77 @@ class TestSQLiteNaiveDatetimeCoercion:
         fetched = await sqlite_store.get_by_id(t.id)
         assert fetched.created_at.tzinfo is not None
         assert fetched.updated_at.tzinfo is not None
+
+
+@pytest.mark.integration
+class TestSearchDialect:
+    """FIX: search() must work on SQLite (LIKE) and PostgreSQL (ILIKE)."""
+
+    async def test_search_sqlite_case_insensitive(self, make_tenant: Callable[..., Tenant]) -> None:
+        store = SQLAlchemyTenantStore("sqlite+aiosqlite:///:memory:")
+        await store.initialize()
+        try:
+            await store.create(make_tenant(identifier="alpha-corp", name="Alpha Corporation"))
+            await store.create(make_tenant(identifier="beta-inc", name="Beta Incorporated"))
+            await store.create(make_tenant(identifier="gamma-llc", name="Gamma LLC"))
+            results = await store.search("alpha")
+            ids = [r.identifier for r in results]
+            assert "alpha-corp" in ids
+            assert "beta-inc" not in ids
+        finally:
+            await store.close()
+
+    async def test_search_sqlite_partial_match(self, make_tenant: Callable[..., Tenant]) -> None:
+        store = SQLAlchemyTenantStore("sqlite+aiosqlite:///:memory:")
+        await store.initialize()
+        try:
+            await store.create(make_tenant(identifier="acme-widgets", name="Acme Widget Co"))
+            await store.create(make_tenant(identifier="acme-anvils", name="Acme Anvil Co"))
+            await store.create(make_tenant(identifier="staple-inc", name="Staple Inc"))
+            results = await store.search("acme")
+            ids = {r.identifier for r in results}
+            assert "acme-widgets" in ids
+            assert "acme-anvils" in ids
+            assert "staple-inc" not in ids
+        finally:
+            await store.close()
+
+    async def test_search_sqlite_metachar_safe(self, make_tenant: Callable[..., Tenant]) -> None:
+        """LIKE metacharacters in the query must not expand to match all rows."""
+        store = SQLAlchemyTenantStore("sqlite+aiosqlite:///:memory:")
+        await store.initialize()
+        try:
+            for i in range(5):
+                await store.create(make_tenant(identifier=f"safe-tenant-{i}"))
+            results = await store.search("%")
+            assert len(results) == 0
+        finally:
+            await store.close()
+
+    @pytest.mark.e2e
+    async def test_search_postgres_ilike(self, make_tenant: Callable[..., Tenant]) -> None:
+        if not _pg_up():
+            pytest.skip("PostgreSQL not reachable")
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        store = SQLAlchemyTenantStore(pg_url, pool_size=2, max_overflow=2)
+        await store.initialize()
+        try:
+            uid = uuid.uuid4().hex[:6]
+            t1 = make_tenant(identifier=f"pg-search-{uid}-alpha")
+            t2 = make_tenant(identifier=f"pg-search-{uid}-beta")
+            await store.create(t1)
+            await store.create(t2)
+            results = await store.search(f"pg-search-{uid}")
+            ids = {r.identifier for r in results}
+            assert t1.identifier in ids
+            assert t2.identifier in ids
+        finally:
+            try:
+                async with store._engine.begin() as conn:
+                    await conn.execute(text("TRUNCATE TABLE tenants RESTART IDENTITY CASCADE"))
+            except Exception:
+                pass
+            await store.close()

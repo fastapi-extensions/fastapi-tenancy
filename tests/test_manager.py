@@ -668,6 +668,15 @@ class TestEncryption:
             await manager.close()
             await store.close()
 
+    def test_decrypt_tenant_fields_no_changes_returns_same(self) -> None:
+        enc = TenancyEncryption(_derive_key(_ENC_KEY))
+        t = _tenant()
+
+        result = enc.decrypt_tenant_fields(t)
+
+        # Should return original object (no updates)
+        assert result is t
+
 
 @pytest.mark.unit
 class TestAuditLogWriterRuntime:

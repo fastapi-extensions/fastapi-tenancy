@@ -139,16 +139,72 @@ class TenantContext:
         _tenant_ctx.reset(token)
 
     @staticmethod
-    def clear() -> None:
-        """Clear both the tenant and all metadata from the current context.
+    def clear() -> tuple[Token[Tenant | None], Token[dict[str, Any] | None]]:
+        """Set both the tenant and all metadata to ``None`` in the current context.
 
-        Typically called in middleware ``finally`` blocks to guarantee cleanup
-        after request processing regardless of whether an exception occurred.
-        Only use this when you are certain there is no outer tenant scope to
-        restore; otherwise use ``reset(token)``.
+        Returns tokens that callers can pass to :meth:`reset_all` to restore
+        the previous state.  This makes ``clear()`` safe for use at any scope
+        depth — not just the outermost one.
+
+        **When to use ``clear()`` vs ``reset(token)``**
+
+        - :meth:`reset` / ``reset_all``: prefer this in all middleware and
+          nested-scope code where a previous state (possibly a non-``None``
+          tenant) should be restored on exit.  This is what
+          :func:`tenant_scope` and :class:`~fastapi_tenancy.middleware.tenancy.TenancyMiddleware`
+          use.
+
+        - ``clear()`` + :meth:`reset_all`: use this in **test fixtures** and
+          application startup/shutdown where you *want* to unconditionally
+          discard any inherited context.  Call ``reset_all(*clear())`` in the
+          fixture teardown to restore whatever was there before (usually
+          ``None``, but safe either way).
+
+        Returns:
+            A ``(tenant_token, metadata_token)`` tuple.  Pass both to
+            :meth:`reset_all` to restore the previous state.
+
+        Example — test fixture (safe at any nesting depth):
+
+        .. code-block:: python
+
+            @pytest.fixture(autouse=True)
+            def clean_context():
+                tokens = TenantContext.clear()
+                yield
+                TenantContext.reset_all(*tokens)
         """
-        _tenant_ctx.set(None)
-        _metadata_ctx.set(None)
+        tenant_token = _tenant_ctx.set(None)
+        meta_token = _metadata_ctx.set(None)
+        return tenant_token, meta_token
+
+    @staticmethod
+    def reset_all(
+        tenant_token: Token[Tenant | None],
+        metadata_token: Token[dict[str, Any] | None],
+    ) -> None:
+        """Restore both context variables to the state captured by *clear()*.
+
+        This is the counterpart to :meth:`clear`.  Use it in ``finally``
+        blocks or fixture teardowns to restore exactly the state that existed
+        before ``clear()`` was called, regardless of scope depth.
+
+        Args:
+            tenant_token: Token returned by a previous :meth:`clear` call.
+            metadata_token: Token returned by the same :meth:`clear` call.
+
+        Example:
+
+        .. code-block:: python
+
+            tokens = TenantContext.clear()
+            try:
+                ...
+            finally:
+                TenantContext.reset_all(*tokens)
+        """
+        _tenant_ctx.reset(tenant_token)
+        _metadata_ctx.reset(metadata_token)
 
     ######################
     # Metadata accessors #
@@ -203,13 +259,30 @@ class TenantContext:
         return dict(meta) if meta is not None else {}
 
     @staticmethod
-    def clear_metadata() -> None:
-        """Clear all metadata while keeping the tenant set.
+    def clear_metadata() -> Token[dict[str, Any] | None]:
+        """Set all metadata to ``None`` while keeping the tenant set.
 
-        Useful in middleware that wants to reset per-request supplementary
-        data without disturbing the tenant identity.
+        Returns a token that callers can pass to ``_metadata_ctx.reset(token)``
+        to restore the previous metadata state.  This makes the method safe for
+        use in nested scopes — not just at the outermost request level.
+
+        Useful in middleware that wants to reset per-request supplementary data
+        without disturbing the tenant identity.
+
+        Returns:
+            A ``Token`` that can restore the previous metadata state.
+
+        Example:
+
+        .. code-block:: python
+
+            token = TenantContext.clear_metadata()
+            try:
+                ...
+            finally:
+                _metadata_ctx.reset(token)  # or just let it drop at outermost scope
         """
-        _metadata_ctx.set(None)
+        return _metadata_ctx.set(None)
 
 
 ##############################################################

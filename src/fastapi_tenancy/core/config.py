@@ -175,12 +175,39 @@ class TenancyConfig(BaseSettings):
     cache_ttl: int = Field(
         default=3600,
         ge=0,
-        description="Default time-to-live for cached tenant objects (seconds).",
+        description=(
+            "Time-to-live for tenant objects stored in the Redis write-through "
+            "cache (seconds).  Controls the SETEX TTL in RedisTenantStore.  "
+            "See also ``l1_cache_ttl_seconds`` for the in-process LRU TTL."
+        ),
     )
 
     cache_enabled: bool = Field(
         default=False,
         description="Enable the Redis write-through cache for tenant lookups.",
+    )
+
+    l1_cache_max_size: int = Field(
+        default=1000,
+        ge=10,
+        le=100_000,
+        description=(
+            "Maximum number of Tenant objects held in the in-process LRU cache "
+            "(TenantCache).  Least-recently-used entries are evicted when full.  "
+            "Set this >= your expected hot-tenant count to avoid thrashing.  "
+            "Can be set via TENANCY_L1_CACHE_MAX_SIZE environment variable."
+        ),
+    )
+
+    l1_cache_ttl_seconds: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Seconds before an in-process L1 cache entry is considered stale.  "
+            "Keep this short (30-120 s) to limit the window where status changes "
+            "(e.g. suspension, deletion) are not yet reflected in running requests.  "
+            "Can be set via TENANCY_L1_CACHE_TTL_SECONDS environment variable."
+        ),
     )
 
     #################
@@ -216,7 +243,7 @@ class TenancyConfig(BaseSettings):
 
     domain_suffix: str | None = Field(
         default=None,
-        description=("Base domain suffix for SUBDOMAIN resolution (e.g. ``'.example.com'``)."),
+        description="Base domain suffix for SUBDOMAIN resolution (e.g. ``'.example.com'``).",
     )
 
     path_prefix: str = Field(

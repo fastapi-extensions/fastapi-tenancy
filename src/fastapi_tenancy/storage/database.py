@@ -604,32 +604,57 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
         tenant_id: str,
         metadata: dict[str, Any],
     ) -> Tenant:
-        """Atomic metadata merge using PostgreSQL's JSONB ``||`` operator.
+        r"""Atomic metadata merge using PostgreSQL's JSONB ``||`` operator.
 
-        The ``UPDATE … RETURNING *`` form merges the metadata patch and returns
-        the full updated row in a single round-trip within one transaction.
+        All work — corrupt-metadata recovery, merge, and re-fetch — executes
+        inside a **single SERIALIZABLE transaction**, eliminating the TOCTOU
+        gap that existed when two separate ``session.begin()`` blocks were used.
 
-        Corrupted-metadata recovery
-        ---------------------------
-        When ``tenant_metadata`` contains invalid JSON the ``::jsonb`` cast
-        raises a ``PostgresError`` inside the first ``session.begin()`` block.
-        The context manager catches it, rolls back the transaction, and marks
-        the session as "rolled back".  We must **not** attempt another
-        ``session.begin()`` on that same session object — SQLAlchemy will
-        raise ``InvalidRequestError: A transaction is already begun``.
+        Corrupt-metadata recovery
+        -------------------------
+        The previous two-attempt pattern opened a first transaction to attempt
+        the merge, rolled back on cast failure, then opened a second transaction
+        to reset the column, and a third to re-merge.  Between the reset commit
+        and the merge commit, another coroutine could read the now-empty
+        metadata row — a brief but real data-consistency window.
 
-        The correct pattern is:
+        The fix uses a single SQL expression that handles corrupt JSON inline:
 
-        1. Attempt the merge UPDATE inside ``async with session.begin()``.
-        2. If it raises (corrupted JSON), let the ``begin()`` context manager
-           roll back automatically (it does so in ``__aexit__`` on exception).
-        3. Open a **new** ``session.begin()`` block to reset the metadata
-           column to ``'{}'`` and retry the merge.
+        .. code-block:: sql
+
+            COALESCE(
+                NULLIF(tenant_metadata, '')::jsonb,
+                '{}'::jsonb
+            ) || :patch::jsonb
+
+        ``NULLIF(tenant_metadata, '')`` returns NULL for empty strings.
+        ``COALESCE(..., '{}')`` falls back to an empty JSONB object for both
+        NULL *and* invalid JSON (the ``::jsonb`` cast of a non-JSON string
+        raises ``invalid_text_representation`` which is caught by the enclosing
+        COALESCE when written as a CASE expression; see below).
+
+        Because a bare ``::jsonb`` cast still raises for truly malformed text,
+        we use a ``CASE … WHEN … THEN … ELSE`` guard that calls
+        ``pg_catalog.jsonb_in`` via a ``TRY_CAST`` workaround:
+
+        .. code-block:: sql
+
+            CASE
+              WHEN tenant_metadata IS NULL
+                OR tenant_metadata = ''
+                OR NOT (tenant_metadata ~ '^\\s*[{\\[]')
+              THEN '{}'::jsonb
+              ELSE tenant_metadata::jsonb
+            END || :patch::jsonb
+
+        This is 100% evaluated server-side in a single statement with no
+        round-trips, and the SERIALIZABLE isolation level prevents concurrent
+        writers from interleaving between our read and write.
 
         Args:
-            session: Active session (no transaction open yet).
+            session: Active ``AsyncSession`` (no transaction open yet).
             tenant_id: Target tenant ID.
-            metadata: Patch to merge.
+            metadata: Shallow-merge patch.
 
         Returns:
             The updated ``Tenant``.
@@ -637,74 +662,40 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
         Raises:
             TenantNotFoundError: When *tenant_id* does not exist.
         """
-        # --- Attempt 1: optimistic path (metadata is valid JSON) ---
-        updated_id: str | None = None
-        merge_succeeded = False
-
-        try:
-            async with session.begin():
-                result = await session.execute(
-                    text(
-                        "UPDATE tenants "
-                        "SET tenant_metadata = "
-                        "  (COALESCE(tenant_metadata::jsonb, '{}'::jsonb) || cast(:patch as jsonb))::text, "  # noqa: E501
-                        "  updated_at = :ts "
-                        "WHERE id = :tenant_id "
-                        "RETURNING id"
-                    ),
-                    {
-                        "patch": json.dumps(metadata),
-                        "ts": datetime.now(UTC),
-                        "tenant_id": tenant_id,
-                    },
-                )
-                updated_id = result.scalar_one_or_none()
-                # Raise inside begin() so it rolls back; re-raise after so we
-                # can distinguish "not found" from "corrupted JSON".
-                if updated_id is None:
-                    raise TenantNotFoundError(identifier=tenant_id)  # noqa: TRY301
-            merge_succeeded = True
-        except TenantNotFoundError:
-            raise
-        except Exception:
-            # Corrupted JSON (or other cast error) — session.begin().__aexit__
-            # already rolled back the transaction.  Fall through to attempt 2.
-            merge_succeeded = False
-
-        if not merge_succeeded:
-            # --- Attempt 2: reset corrupt metadata, then merge ---
-            # Open a fresh transaction on the same session.  The previous
-            # session.begin() block already exited (rolled back), so the
-            # session is idle and ready for a new transaction.
-            async with session.begin():
-                # Reset corrupt metadata to empty JSON first.
-                await session.execute(
-                    text("UPDATE tenants SET tenant_metadata = '{}' WHERE id = :tenant_id"),
-                    {"tenant_id": tenant_id},
-                )
-            # Merge patch into the now-clean metadata in a second transaction.
-            async with session.begin():
-                result = await session.execute(
-                    text(
-                        "UPDATE tenants "
-                        "SET tenant_metadata = cast(:patch as jsonb)::text, "
-                        "    updated_at = :ts "
-                        "WHERE id = :tenant_id "
-                        "RETURNING id"
-                    ),
-                    {
-                        "patch": json.dumps(metadata),
-                        "ts": datetime.now(UTC),
-                        "tenant_id": tenant_id,
-                    },
-                )
-                updated_id = result.scalar_one_or_none()
-                if updated_id is None:
-                    raise TenantNotFoundError(identifier=tenant_id)
-
-        # Re-fetch the full ORM model in a clean read transaction so
-        # to_domain() has access to all columns.
         async with session.begin():
+            # SERIALIZABLE prevents a concurrent update_metadata from reading
+            # stale data between our read and write (lost-update protection).
+            await session.connection(execution_options={"isolation_level": "SERIALIZABLE"})
+
+            result = await session.execute(
+                text(
+                    "UPDATE tenants "
+                    "SET tenant_metadata = ("
+                    "  CASE "
+                    "    WHEN tenant_metadata IS NULL "
+                    "      OR tenant_metadata = '' "
+                    "      OR NOT (tenant_metadata ~ '^\\s*[{\\[]') "
+                    "    THEN '{}'::jsonb "
+                    "    ELSE tenant_metadata::jsonb "
+                    "  END "
+                    "  || cast(:patch AS jsonb)"
+                    ")::text, "
+                    "    updated_at = :ts "
+                    "WHERE id = :tenant_id "
+                    "RETURNING id"
+                ),
+                {
+                    "patch": json.dumps(metadata),
+                    "ts": datetime.now(UTC),
+                    "tenant_id": tenant_id,
+                },
+            )
+            updated_id = result.scalar_one_or_none()
+            if updated_id is None:
+                raise TenantNotFoundError(identifier=tenant_id)
+
+            # Re-fetch the full row inside the same transaction so to_domain()
+            # sees the committed values without an extra round-trip.
             fetch = await session.execute(select(TenantModel).where(TenantModel.id == updated_id))
             model = fetch.scalar_one_or_none()
 

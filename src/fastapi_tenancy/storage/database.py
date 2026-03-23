@@ -588,15 +588,38 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
             TenantNotFoundError: When *tenant_id* does not exist.
             TenancyError: On unexpected storage failure.
         """
-        async with self._session_factory() as session:
-            try:
-                if self._dialect == DbDialect.POSTGRESQL:
-                    return await self._update_metadata_pg(session, tenant_id, metadata)
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        if self._dialect != DbDialect.POSTGRESQL:
+            async with self._session_factory() as session:
                 return await self._update_metadata_generic(session, tenant_id, metadata)
-            except TenantNotFoundError:
-                raise
-            except Exception as exc:
-                raise TenancyError(f"Failed to update metadata: {exc}") from exc
+
+        _MAX_RETRIES = 5
+        _BASE_BACKOFF = 0.005
+
+        for attempt in range(_MAX_RETRIES):
+            async with self._session_factory() as session:
+                try:
+                    return await self._update_metadata_pg(session, tenant_id, metadata)
+
+                except TenantNotFoundError:
+                    raise
+
+                except Exception as exc:
+                    is_serialization = (
+                        "SerializationError" in type(exc).__name__
+                        or "SerializationError" in type(getattr(exc, "orig", None)).__name__
+                        or "could not serialize" in str(exc).lower()
+                    )
+
+                    if is_serialization and attempt < _MAX_RETRIES - 1:
+                        backoff = _BASE_BACKOFF * (2**attempt)
+                        await _asyncio.sleep(backoff)
+                        continue
+
+                    raise TenancyError(f"Failed to update metadata: {exc}") from exc
+
+        raise TenancyError(f"update_metadata exhausted retries for tenant {tenant_id!r}")
 
     async def _update_metadata_pg(
         self,
@@ -612,30 +635,8 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
 
         Corrupt-metadata recovery
         -------------------------
-        The previous two-attempt pattern opened a first transaction to attempt
-        the merge, rolled back on cast failure, then opened a second transaction
-        to reset the column, and a third to re-merge.  Between the reset commit
-        and the merge commit, another coroutine could read the now-empty
-        metadata row — a brief but real data-consistency window.
-
-        The fix uses a single SQL expression that handles corrupt JSON inline:
-
-        .. code-block:: sql
-
-            COALESCE(
-                NULLIF(tenant_metadata, '')::jsonb,
-                '{}'::jsonb
-            ) || :patch::jsonb
-
-        ``NULLIF(tenant_metadata, '')`` returns NULL for empty strings.
-        ``COALESCE(..., '{}')`` falls back to an empty JSONB object for both
-        NULL *and* invalid JSON (the ``::jsonb`` cast of a non-JSON string
-        raises ``invalid_text_representation`` which is caught by the enclosing
-        COALESCE when written as a CASE expression; see below).
-
-        Because a bare ``::jsonb`` cast still raises for truly malformed text,
-        we use a ``CASE … WHEN … THEN … ELSE`` guard that calls
-        ``pg_catalog.jsonb_in`` via a ``TRY_CAST`` workaround:
+        A ``CASE … WHEN … ELSE`` guard handles ``NULL``, empty-string, and
+        non-JSON values inline, without a separate reset transaction:
 
         .. code-block:: sql
 
@@ -647,9 +648,19 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
               ELSE tenant_metadata::jsonb
             END || :patch::jsonb
 
-        This is 100% evaluated server-side in a single statement with no
-        round-trips, and the SERIALIZABLE isolation level prevents concurrent
-        writers from interleaving between our read and write.
+        Retry on serialization failure
+        --------------------------------
+        SERIALIZABLE transactions correctly abort concurrent writers with
+        ``SerializationError`` (pgcode ``40001``).  This is by design — the
+        database guarantees that at most one of N concurrent writers succeeds
+        without a retry.  The caller *must* retry on this error class; simply
+        surfacing it as a ``TenancyError`` would make ``update_metadata``
+        non-functional under any meaningful concurrency.
+
+        We retry up to ``_MAX_RETRIES`` times with an exponential back-off.
+        The back-off starts at 5 ms and is kept short because the competing
+        transaction has already committed by the time we receive the error —
+        the retry is nearly always immediately successful.
 
         Args:
             session: Active ``AsyncSession`` (no transaction open yet).
@@ -661,48 +672,94 @@ class SQLAlchemyTenantStore(TenantStore[Tenant]):
 
         Raises:
             TenantNotFoundError: When *tenant_id* does not exist.
+            TenancyError: When all retry attempts are exhausted.
         """
-        async with session.begin():
-            # SERIALIZABLE prevents a concurrent update_metadata from reading
-            # stale data between our read and write (lost-update protection).
-            await session.connection(execution_options={"isolation_level": "SERIALIZABLE"})
+        import asyncio as _asyncio  # noqa: PLC0415
 
-            result = await session.execute(
-                text(
-                    "UPDATE tenants "
-                    "SET tenant_metadata = ("
-                    "  CASE "
-                    "    WHEN tenant_metadata IS NULL "
-                    "      OR tenant_metadata = '' "
-                    "      OR NOT (tenant_metadata ~ '^\\s*[{\\[]') "
-                    "    THEN '{}'::jsonb "
-                    "    ELSE tenant_metadata::jsonb "
-                    "  END "
-                    "  || cast(:patch AS jsonb)"
-                    ")::text, "
-                    "    updated_at = :ts "
-                    "WHERE id = :tenant_id "
-                    "RETURNING id"
-                ),
-                {
-                    "patch": json.dumps(metadata),
-                    "ts": datetime.now(UTC),
-                    "tenant_id": tenant_id,
-                },
-            )
-            updated_id = result.scalar_one_or_none()
-            if updated_id is None:
-                raise TenantNotFoundError(identifier=tenant_id)
+        _MAX_RETRIES = 5
+        _BASE_BACKOFF = 0.005  # 5 ms — competing txn already committed
 
-            # Re-fetch the full row inside the same transaction so to_domain()
-            # sees the committed values without an extra round-trip.
-            fetch = await session.execute(select(TenantModel).where(TenantModel.id == updated_id))
-            model = fetch.scalar_one_or_none()
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with session.begin():
+                    # SERIALIZABLE prevents a concurrent update_metadata from
+                    # reading stale data between our read and write.
+                    await session.connection(execution_options={"isolation_level": "SERIALIZABLE"})
 
-        if model is None:  # pragma: no cover — RETURNING guarantees existence
-            raise TenantNotFoundError(identifier=tenant_id)
-        logger.info("Updated metadata (pg-atomic) for tenant id=%s", tenant_id)
-        return model.to_domain()
+                    result = await session.execute(
+                        text(
+                            "UPDATE tenants "
+                            "SET tenant_metadata = ("
+                            "  CASE "
+                            "    WHEN tenant_metadata IS NULL "
+                            "      OR tenant_metadata = '' "
+                            "      OR NOT (tenant_metadata ~ '^\\s*[{\\[]') "
+                            "    THEN '{}'::jsonb "
+                            "    ELSE tenant_metadata::jsonb "
+                            "  END "
+                            "  || cast(:patch AS jsonb)"
+                            ")::text, "
+                            "    updated_at = :ts "
+                            "WHERE id = :tenant_id "
+                            "RETURNING id"
+                        ),
+                        {
+                            "patch": json.dumps(metadata),
+                            "ts": datetime.now(UTC),
+                            "tenant_id": tenant_id,
+                        },
+                    )
+                    updated_id = result.scalar_one_or_none()
+                    if updated_id is None:
+                        raise TenantNotFoundError(identifier=tenant_id)  # noqa: TRY301
+
+                    # Re-fetch the full row inside the same transaction so
+                    # to_domain() sees the committed values without an extra
+                    # round-trip.
+                    fetch = await session.execute(
+                        select(TenantModel).where(TenantModel.id == updated_id)
+                    )
+                    model = fetch.scalar_one_or_none()
+
+                if model is None:  # pragma: no cover — RETURNING guarantees existence
+                    raise TenantNotFoundError(identifier=tenant_id)  # noqa: TRY301
+                logger.info("Updated metadata (pg-atomic) for tenant id=%s", tenant_id)
+                return model.to_domain()
+
+            except TenantNotFoundError:
+                raise
+
+            except Exception as exc:
+                # Detect PostgreSQL serialization failure (pgcode 40001).
+                # asyncpg wraps this as SerializationError; SQLAlchemy wraps
+                # that in DBAPIError.  We check the class name so we don't
+                # require a hard import of asyncpg here.
+                is_serialization = (
+                    "SerializationError" in type(exc).__name__
+                    or "SerializationError" in type(getattr(exc, "orig", None)).__name__
+                    or "could not serialize" in str(exc).lower()
+                )
+                if is_serialization and attempt < _MAX_RETRIES - 1:
+                    backoff = _BASE_BACKOFF * (2**attempt)
+                    logger.debug(
+                        "Serialization conflict on metadata update for tenant %s "
+                        "(attempt %d/%d) — retrying in %.0f ms",
+                        tenant_id,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        backoff * 1000,
+                    )
+                    await _asyncio.sleep(backoff)
+                    # The session is in a rolled-back state after the failed
+                    # begin() block — safe to open a new begin() next iteration.
+                    continue
+
+                raise  # non-serialization error, or retries exhausted
+
+        # Should be unreachable: loop always returns or raises inside.
+        raise TenancyError(  # pragma: no cover
+            f"update_metadata exhausted all {_MAX_RETRIES} retries for tenant {tenant_id!r}"
+        )
 
     async def _update_metadata_generic(
         self,

@@ -425,15 +425,26 @@ class TestPostgresDatabaseProvider:
 
 @pytest.mark.integration
 class TestCreationLocksLeak:
-    """FIX: _creation_locks must be cleaned up even when engine creation fails."""
+    """FIX: _creation_locks (WeakValueDictionary) must not retain stale Lock entries.
+
+    With WeakValueDictionary, an entry disappears automatically once no live
+    Python reference to the Lock object remains.  The tests call gc.collect()
+    after dropping local references to ensure the GC has had a chance to
+    reclaim entries before the assertion runs.
+    """
 
     async def test_lock_removed_after_successful_creation(
         self, make_tenant: Callable[..., Tenant]
     ) -> None:
+        import gc  # noqa: PLC0415
+
         provider = DatabaseIsolationProvider(_db_cfg())
         tenant = make_tenant(identifier="lock-ok")
         try:
             await provider._get_engine(tenant)
+            # Drop any implicit reference held in the local frame and run GC so
+            # the WeakValueDictionary entry is collected before the assertion.
+            gc.collect()
             assert tenant.id not in provider._creation_locks
         finally:
             await provider.close()
@@ -441,6 +452,7 @@ class TestCreationLocksLeak:
     async def test_lock_removed_on_engine_creation_failure(
         self, make_tenant: Callable[..., Tenant]
     ) -> None:
+        import gc  # noqa: PLC0415
 
         provider = DatabaseIsolationProvider(_db_cfg())
         tenant = make_tenant(identifier="lock-fail")
@@ -452,6 +464,10 @@ class TestCreationLocksLeak:
             pytest.raises(RuntimeError, match="simulated failure"),
         ):
             await provider._get_engine(tenant)
+        # After the exception propagates, the local `tenant_lock` reference
+        # inside _get_engine drops.  A GC cycle removes the WeakValueDictionary
+        # entry so future attempts start fresh with no stale lock.
+        gc.collect()
         assert tenant.id not in provider._creation_locks
         await provider.close()
 

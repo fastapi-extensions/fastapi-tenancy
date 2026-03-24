@@ -167,20 +167,43 @@ class RLSIsolationProvider(BaseIsolationProvider):
         Uses ``SELECT set_config('app.current_tenant', :id, TRUE)`` — a
         fully parameterised call — to avoid injection via crafted tenant IDs.
 
-        Critical implementation detail — connection-level event listener
-        -----------------------------------------------------------------
+        Connection-level event listener design
+        ---------------------------------------
         ``set_config(..., TRUE)`` (equivalent to ``SET LOCAL``) is
         **transaction-scoped**: the GUC reverts when the current transaction
         ends.  If we simply call it once before yielding, any subsequent
         ``session.begin()`` block opened by the route handler would operate
         without the GUC, silently bypassing all RLS policies.
 
-        The fix mirrors ``SchemaIsolationProvider._schema_session``: install
-        a ``begin`` event listener on the underlying synchronous connection so
-        that ``set_config`` is re-executed at the start of **every**
-        transaction opened on this connection during the request lifetime.
-        This is the pattern recommended by the SQLAlchemy docs for
-        connection-level configuration that must survive multiple transactions.
+        The fix is to install a ``begin`` event listener on the underlying
+        synchronous DBAPI *connection* object so that ``set_config`` is
+        re-executed at the start of **every** transaction opened on this
+        connection during the request lifetime.
+
+        Critical: the listener must be removed before the connection returns
+        to the pool. Without removal, when the physical connection is reused
+        by a future request for a *different* tenant, the old tenant's GUC
+        listener fires on every new transaction — a silent cross-tenant
+        data-read breach.
+
+        We save the listener function as a local variable and call
+        ``event.remove(sync_conn, "begin", _set_rls_guc)`` in a ``finally``
+        block that wraps the entire session lifetime.  The ``finally`` is
+        positioned *outside* the ``AsyncSession`` context manager so it always
+        runs — even if ``AsyncSession`` construction raises, or if an uncaught
+        exception propagates from the route handler.
+
+        Parameterisation note
+        ----------------------
+        Two different parameterisation syntaxes are intentionally used:
+
+        1. ``exec_driver_sql`` (in the ``begin`` listener): uses the native
+           asyncpg ``$1`` placeholder because ``exec_driver_sql`` bypasses
+           SQLAlchemy's parameter rendering layer entirely.
+        2. ``session.execute + text()`` (initial GUC set): uses SQLAlchemy's
+           ``:name`` syntax, translated to ``$1`` by asyncpg at render time.
+
+        Both are correct for their respective call sites.
 
         Args:
             tenant: Currently active tenant.
@@ -193,55 +216,60 @@ class RLSIsolationProvider(BaseIsolationProvider):
         """
         from sqlalchemy import event  # noqa: PLC0415
 
-        async with AsyncSession(self.engine, expire_on_commit=False) as session:
-            try:
-                conn = await session.connection()
-                sync_conn = conn.sync_connection
+        # sync_conn is obtained inside the session context; initialise to None
+        # so the finally block can safely guard against the case where the
+        # session never opened (e.g. pool exhausted before AsyncSession init).
+        sync_conn: Any = None
 
-                await session.execute(
-                    text("SELECT set_config(:guc, :val, TRUE)"),
-                    {"guc": _RLS_GUC, "val": tenant.id},
-                )
+        def _set_rls_guc(sync_connection: Any) -> None:
+            """Re-apply the RLS GUC at the start of every transaction.
 
-                # Install a connection-level listener so the GUC is re-applied
-                # at the start of every transaction opened on this connection.
-                # The listener uses set_config(..., TRUE) which is transaction-
-                # local: the GUC reverts automatically when the transaction ends,
-                # so pooled connections never carry a stale tenant_id.
-                @event.listens_for(sync_conn, "begin")
-                def _set_rls_guc(sync_connection) -> None:  # type: ignore[no-untyped-def]  # noqa: ANN001
-                    # _RLS_GUC is a module-level constant ("app.current_tenant")
-                    # defined in this file — it is never user-supplied and cannot
-                    # be influenced by tenant data.  The f-string is therefore safe.
-                    # tenant.id is passed as a positional bind parameter ($1) so
-                    # it is never interpolated into the SQL string.
-                    #
-                    # NOTE: Two different parameterisation syntaxes are intentionally
-                    # used in this method:
-                    #   1. exec_driver_sql (here, in the listener): uses the native
-                    #      asyncpg "$1" placeholder because exec_driver_sql bypasses
-                    #      SQLAlchemy's parameter rendering layer entirely.
-                    #   2. session.execute + text() (below): uses SQLAlchemy's ":name"
-                    #      syntax because it goes through the full SQLAlchemy rendering
-                    #      pipeline which translates ":name" to "$1" for asyncpg.
-                    # Both are correct for their respective call sites.
-                    sync_connection.exec_driver_sql(
-                        f"SELECT set_config('{_RLS_GUC}', $1, TRUE)",
-                        (tenant.id,),
+            Called by the SQLAlchemy ``begin`` event on the individual DBAPI
+            connection.  ``_RLS_GUC`` is a module-level constant — it is never
+            user-supplied and cannot be influenced by tenant data.  The f-string
+            interpolation of ``_RLS_GUC`` is therefore safe.  ``tenant.id`` is
+            passed as a positional bind parameter (``$1``) and is never
+            interpolated into the SQL string.
+            """
+            sync_connection.exec_driver_sql(
+                f"SELECT set_config('{_RLS_GUC}', $1, TRUE)",
+                (tenant.id,),
+            )
+            logger.debug("RLS GUC %s = %r (tenant %s)", _RLS_GUC, tenant.id, tenant.id)
+
+        try:
+            async with AsyncSession(self.engine, expire_on_commit=False) as session:
+                try:
+                    conn = await session.connection()
+                    sync_conn = conn.sync_connection
+
+                    # Set the GUC for the *current* transaction immediately so
+                    # the session is isolated from the moment it is yielded.
+                    await session.execute(
+                        text("SELECT set_config(:guc, :val, TRUE)"),
+                        {"guc": _RLS_GUC, "val": tenant.id},
                     )
-                    logger.debug("Set %s = %r (tenant %s)", _RLS_GUC, tenant.id, tenant.id)
 
-                # Yield session without starting transaction - let caller manage it
-                yield session
-            except IsolationError:
-                raise
-            except Exception as exc:
-                await session.rollback()
-                raise IsolationError(
-                    operation="get_session",
-                    tenant_id=tenant.id,
-                    details={"guc": _RLS_GUC, "error": str(exc)},
-                ) from exc
+                    # Install the per-connection begin listener *after* we have
+                    # a reference to sync_conn so the finally block can remove it.
+                    event.listen(sync_conn, "begin", _set_rls_guc)
+
+                    yield session
+                except IsolationError:
+                    raise
+                except Exception as exc:
+                    await session.rollback()
+                    raise IsolationError(
+                        operation="get_session",
+                        tenant_id=tenant.id,
+                        details={"guc": _RLS_GUC, "error": str(exc)},
+                    ) from exc
+        finally:
+            # Always remove the begin listener so the pooled connection is
+            # returned to the pool in a clean state — no stale GUC callbacks
+            # that would set the wrong tenant on the next request.
+            if sync_conn is not None and event.contains(sync_conn, "begin", _set_rls_guc):
+                event.remove(sync_conn, "begin", _set_rls_guc)
 
     async def apply_filters(self, query: SelectT, tenant: Tenant) -> SelectT:
         """Add defence-in-depth ``WHERE tenant_id = :id`` to *query*.

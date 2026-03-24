@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/fastapi-tenancy-logo-256.svg" alt="fastapi-tenancy" width="120" />
+<img src="https://raw.githubusercontent.com/fastapi-extensions/fastapi-tenancy/main/docs/assets/fastapi-tenancy-logo-vertical.svg" alt="fastapi-tenancy" width="120" />
 
 # fastapi-tenancy
 
@@ -12,6 +12,8 @@ Schema · Database · RLS · Hybrid isolation — fully async, fully typed
 [![Python](https://img.shields.io/pypi/pyversions/fastapi-tenancy?logo=python&logoColor=white)](https://pypi.org/project/fastapi-tenancy/)
 [![CI](https://github.com/fastapi-extensions/fastapi-tenancy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fastapi-extensions/fastapi-tenancy/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy/graph/badge.svg?token=a4f8805e-fb44-41f7-aa4c-df9b54ecc36f)](https://codecov.io/gh/fastapi-extensions/fastapi-tenancy)
+[![Downloads](https://static.pepy.tech/badge/fastapi-tenancy)](https://pepy.tech/project/fastapi-tenancy)
+[![Monthly](https://static.pepy.tech/badge/fastapi-tenancy/month)](https://pepy.tech/project/fastapi-tenancy)
 [![Docs](https://img.shields.io/badge/docs-mkdocs-blue?logo=readthedocs&logoColor=white)](https://fastapi-tenancy.readthedocs.io)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e.svg)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)

@@ -47,6 +47,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 import logging
 from typing import TYPE_CHECKING, Any
+import weakref
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
@@ -203,7 +204,17 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
         # racing through _get_engine() and creating duplicate engines for the same
         # tenant.  Without this guard a second engine is created, never added to
         # the cache, and its connection pool leaks until the process exits.
-        self._creation_locks: dict[str, asyncio.Lock] = {}
+        #
+        # WeakValueDictionary instead of plain dict:
+        # In high-churn environments (many tenants provisioned/deprovisioned
+        # rapidly), a plain dict can accumulate Lock entries indefinitely.
+        # WeakValueDictionary solves this structurally: when no coroutine holds
+        # a live reference to the Lock (no waiter, no creator), the GC removes
+        # the entry automatically.  The dict never exceeds the number of
+        # *actively contested* tenants at any given moment.
+        self._creation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._creation_locks_lock: asyncio.Lock = asyncio.Lock()
 
         if master_engine is not None:
@@ -280,14 +291,34 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
     async def _get_engine(self, tenant: Tenant) -> AsyncEngine:
         """Return (or lazily create) the per-tenant engine from the LRU cache.
 
-        A fast path checks the cache first without acquiring any lock.  On a
-        cache miss, a per-tenant ``asyncio.Lock`` is acquired so that only one
-        coroutine creates and caches the engine; all other coroutines racing on
-        the same tenant will block briefly and then use the cached engine.
+        Fast path (cache hit)
+        ---------------------
+        Checks the LRU cache first under no lock.  This is the common case
+        for warm tenants and costs zero lock overhead.
 
-        Without the per-tenant lock, two concurrent first-requests for the same
-        tenant would both call ``create_async_engine``, one would be cached and
-        the other would be discarded — leaking its connection pool indefinitely.
+        Slow path (cache miss) — double-checked locking
+        ------------------------------------------------
+        Acquires a per-tenant ``asyncio.Lock`` so that only one coroutine
+        creates and caches the engine for a given tenant.  All other coroutines
+        racing on the same tenant block briefly and then consume the cached
+        result.  Without this guard, concurrent first-requests would both call
+        ``create_async_engine``, one would be cached, the other discarded —
+        but its connection pool would leak indefinitely until process exit.
+
+        WeakValueDictionary lifetime management
+        --------------------------------------------------------
+        ``_creation_locks`` is a ``WeakValueDictionary``.  When no coroutine
+        holds a live reference to the ``asyncio.Lock`` for a tenant (no waiter
+        is blocked on it, no creator executing inside it), the GC removes the
+        entry automatically.  This bounds the dict to the number of *actively
+        contested* tenants at any moment — typically zero in steady state —
+        without manual cleanup.
+
+        The local variable ``tenant_lock`` keeps the lock strongly referenced
+        for the full duration of ``async with tenant_lock``.  This is essential:
+        if the only reference were the WeakValueDictionary entry, the GC could
+        collect the lock between the ``_creation_locks_lock`` release and
+        entering ``async with tenant_lock``.
 
         Args:
             tenant: Target tenant.
@@ -300,15 +331,19 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
         if cached is not None:
             return cached
 
-        # Slow path: acquire a per-tenant creation lock.
+        # Slow path: get-or-create the per-tenant lock inside the guard lock,
+        # then immediately capture a strong local reference so the GC cannot
+        # collect the WeakValueDictionary entry before we enter it.
         async with self._creation_locks_lock:
-            if tenant.id not in self._creation_locks:
-                self._creation_locks[tenant.id] = asyncio.Lock()
-            tenant_lock = self._creation_locks[tenant.id]
+            tenant_lock = self._creation_locks.get(tenant.id)
+            if tenant_lock is None:
+                tenant_lock = asyncio.Lock()
+                self._creation_locks[tenant.id] = tenant_lock
+            # tenant_lock is now strongly referenced by this stack frame.
 
         async with tenant_lock:
-            # Double-check after acquiring the per-tenant lock — another
-            # coroutine may have created and cached the engine while we waited.
+            # Double-check: another coroutine may have created and cached the
+            # engine while we were waiting for tenant_lock.
             cached = await self._engine_cache.get(tenant.id)
             if cached is not None:
                 return cached
@@ -324,35 +359,21 @@ class DatabaseIsolationProvider(BaseIsolationProvider):
                 kw["pool_pre_ping"] = self.config.database_pool_pre_ping
                 kw["pool_recycle"] = self.config.database_pool_recycle
 
-            try:
-                engine = create_async_engine(url, **kw)
-                evicted = await self._engine_cache.put(tenant.id, engine)
-                if evicted is not None:
-                    try:
-                        await evicted.dispose()
-                    except Exception as exc:
-                        logger.warning("Error disposing evicted engine: %s", exc)
-                logger.debug(
-                    "Created engine tenant=%s cached_count=%d", tenant.id, self._engine_cache.size
-                )
-            except Exception:
-                # Clean up the creation lock immediately on failure so the dict
-                # does not leak entries for tenants whose engine creation failed.
-                # Without this finally block, the lock remains in _creation_locks
-                # permanently because the cleanup below is never reached.
-                async with self._creation_locks_lock:
-                    self._creation_locks.pop(tenant.id, None)
-                raise
+            engine = create_async_engine(url, **kw)
+            evicted = await self._engine_cache.put(tenant.id, engine)
+            if evicted is not None:
+                try:
+                    await evicted.dispose()
+                except Exception as exc:
+                    logger.warning("Error disposing evicted engine: %s", exc)
+            logger.debug(
+                "Created engine tenant=%s cached_count=%d",
+                tenant.id,
+                self._engine_cache.size,
+            )
 
-        # Clean up the per-tenant creation lock after the engine is cached so
-        # that the _creation_locks dict does not grow without bound in
-        # high-churn environments (many tenants provisioned and deprovisioned).
-        # It is safe to do this outside the tenant_lock — the engine is already
-        # in the cache, so any subsequent caller will take the fast path and
-        # never reach this slow path again for this tenant.
-        async with self._creation_locks_lock:
-            self._creation_locks.pop(tenant.id, None)
-
+        # tenant_lock local reference drops here.  If no other coroutine is
+        # waiting on it, the WeakValueDictionary entry is GC'd automatically.
         return engine
 
     ###########

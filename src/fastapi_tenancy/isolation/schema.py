@@ -34,6 +34,38 @@ This module applies that pattern consistently in every DDL and session-setup
 call.  The ``LOCAL`` modifier confines the ``search_path`` change to the
 current transaction, preventing it from leaking to other sessions in the pool.
 
+Event listener design — ``Session.after_begin``
+------------------------------------------------
+The final implementation uses ``Session.after_begin(session, transaction,
+connection)`` — a Session-level event that fires for **every** transaction
+the session begins, including those that start after a ``commit()`` releases
+and re-acquires the connection.
+
+Earlier iterations tried:
+
+1. **Engine-level ``begin`` on ``sync_engine``** — race condition: all
+   concurrent requests share one listener, so Tenant A's listener fires on
+   Tenant B's connection.
+
+2. **Pool ``checkout``/``checkin``** — the asyncpg dialect wraps the raw
+   DBAPI connection in ``AdaptedConnection``, which does **not** support
+   SQLAlchemy events.  Attaching ``begin`` to it raises
+   ``InvalidRequestError: No such event 'begin'``.
+
+3. **``Connection.begin`` on ``conn.sync_connection``** — fires only while
+   the same physical connection is held.  After ``session.commit()`` with
+   ``autobegin=False``, the connection is released back to the pool and the
+   next transaction uses a *new* ``Connection`` object, making the listener
+   on the old object useless.
+
+``Session.after_begin`` solves all three problems:
+
+- It is scoped to **this session object** — invisible to other sessions.
+- It fires for **every** transaction, even after commits that release
+  the underlying connection back to the pool.
+- It receives the **current** ``Connection`` as an argument so
+  ``SET LOCAL search_path`` can be issued on the correct connection.
+
 Security
 --------
 Every schema / table name is validated with :func:`assert_safe_schema_name`
@@ -227,38 +259,50 @@ class SchemaIsolationProvider(BaseIsolationProvider):
     async def _schema_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
         """Yield a session with ``search_path`` set to the tenant's schema.
 
-        Critical implementation detail — connection-level event listener
-        -----------------------------------------------------------------
-        ``SET LOCAL search_path`` is transaction-scoped: it reverts when the
-        transaction commits or rolls back.  Under SQLAlchemy's autocommit
-        mode, or whenever the route handler opens its own ``session.begin()``
-        block after this method yields, the ``search_path`` would silently
-        revert to the database default — breaking schema isolation.
-
-        The fix is to install a ``@event.listens_for(conn.sync_connection,
-        "begin")`` listener that re-applies ``SET LOCAL search_path`` at the
-        start of **every** transaction opened on this connection during the
-        request lifetime.  This is the pattern recommended by the SQLAlchemy
-        docs for connection-level configuration that must survive multiple
-        transactions on the same connection.
-
-        PostgreSQL's ``SET`` command does **not** support bound parameters.
-        The asyncpg driver rejects ``SET search_path TO :schema``.  After
-        :func:`~fastapi_tenancy.utils.validation.assert_safe_schema_name`
-        validates *schema* contains only safe characters, it is safe to
-        interpolate as a literal.
-
-        SQLAlchemy 2.0 note
+        Isolation mechanism
         -------------------
-        ``session.connection()`` implicitly starts a transaction, which means
-        any subsequent ``async with session.begin()`` in the route handler
-        would raise ``InvalidRequestError: A transaction is already begun``.
-        To avoid this we register the event listener on the *checkout* event
-        of the engine's sync connection pool instead.  The ``checkout`` event
-        fires each time a connection is retrieved from the pool, before the
-        session starts a transaction, so we can safely call
-        ``exec_driver_sql`` there and then call ``SET LOCAL`` again at the
-        start of every subsequent transaction via the ``begin`` listener.
+        ``SET LOCAL search_path`` is **transaction-scoped**: PostgreSQL reverts
+        it automatically when the current transaction ends.  To ensure every
+        transaction on this session — including those that start after a
+        ``commit()`` — uses the correct schema, we listen to the
+        ``Session.after_begin`` event on the underlying sync session.
+
+        Why ``Session.after_begin``, not ``Connection.begin``
+        -------------------------------------------------------
+        ``Connection.begin`` fires on the Connection object returned by
+        ``await session.connection()``.  However, when a session commits with
+        ``autobegin=False``, SQLAlchemy **releases the connection back to the
+        pool** and acquires a new one for the next transaction.  The next
+        transaction therefore runs on a *different* ``Connection`` object —
+        making a listener on the old ``Connection`` useless for subsequent
+        transactions.
+
+        ``Session.after_begin(session, transaction, connection)`` fires
+        **every** time the session starts a new transaction, regardless of how
+        many commits have occurred, and provides the *current* ``Connection``
+        as an argument.  This makes it the correct hook for re-applying
+        ``SET LOCAL search_path`` after every commit/begin cycle.
+
+        The listener is registered on ``session.sync_session`` (the underlying
+        synchronous ``Session``), and the ``connection`` argument it receives
+        is the current synchronous ``Connection``.  We call
+        ``connection.exec_driver_sql`` on it directly to issue the SET command
+        before any application SQL runs in that transaction.
+
+        Per-session scope
+        -----------------
+        The listener is on the *session* object, which is created fresh for
+        each call to ``_schema_session``.  It is invisible to any other
+        concurrent session.  It is removed in ``finally`` before the session
+        is discarded so the session object (and its cycle) is garbage-collected
+        cleanly.
+
+        PostgreSQL ``SET`` and bound parameters
+        ----------------------------------------
+        PostgreSQL's ``SET`` statement does **not** accept bound parameters.
+        After :func:`~fastapi_tenancy.utils.validation.assert_safe_schema_name`
+        validates that *schema* contains only ``[a-z0-9_]``, it is safe to
+        interpolate as a literal string.
 
         Args:
             tenant: Currently active tenant.
@@ -272,41 +316,64 @@ class SchemaIsolationProvider(BaseIsolationProvider):
         from sqlalchemy import event  # noqa: PLC0415
 
         schema = self._validated_schema_name(tenant)
-        # After assert_safe_schema_name passes, schema contains only
-        # lowercase letters, digits, and underscores — safe to interpolate.
+        # assert_safe_schema_name guarantees only [a-z0-9_] — safe to interpolate.
         set_path_sql = f'SET LOCAL search_path TO "{schema}", public'
 
-        # Install the begin-event listener on the sync engine's connection pool
-        # so it fires BEFORE any transaction is started on the connection.
-        # This avoids the "A transaction is already begun" error that occurs
-        # when session.connection() is called first (which starts an implicit
-        # transaction) and then the caller opens session.begin().
-        def _on_begin(sync_connection: Any) -> None:
-            sync_connection.exec_driver_sql(set_path_sql)
+        def _after_begin(
+            sync_session: Any,
+            transaction: Any,
+            connection: Any,
+        ) -> None:
+            """Re-apply SET LOCAL search_path at the start of every transaction.
 
-        sync_engine = self.engine.sync_engine
-        event.listen(sync_engine, "begin", _on_begin)
+            Called by SQLAlchemy's Session.after_begin event with the current
+            Connection for this transaction.  Using exec_driver_sql bypasses
+            SQLAlchemy's parameter layer (necessary since SET LOCAL does not
+            accept bound parameters in PostgreSQL).
+            """
+            connection.exec_driver_sql(set_path_sql)
+            logger.debug(
+                "search_path → %r (tenant %s) [after_begin]",
+                schema,
+                tenant.id,
+            )
 
-        async with AsyncSession(self.engine, expire_on_commit=False) as session:
-            try:
-                # Apply search_path immediately for the first transaction so
-                # the session is isolated from the moment it is yielded.
-                await session.execute(text(set_path_sql))
-                logger.debug("search_path → %r (tenant %s)", schema, tenant.id)
-                yield session
-            except IsolationError:
-                raise
-            except Exception as exc:
-                await session.rollback()
-                raise IsolationError(
-                    operation="get_session",
-                    tenant_id=tenant.id,
-                    details={"schema": schema, "error": str(exc)},
-                ) from exc
-            finally:
-                # Always remove the listener so it doesn't fire for other
-                # sessions or tenants that reuse connections from this pool.
-                event.remove(sync_engine, "begin", _on_begin)
+        try:
+            async with AsyncSession(self.engine, expire_on_commit=False) as session:
+                # Register the after_begin listener on the underlying sync
+                # session — this fires for every transaction, including those
+                # that start after a commit() releases the connection.
+                event.listen(session.sync_session, "after_begin", _after_begin)
+                try:
+                    # Apply search_path immediately for the first transaction.
+                    # The after_begin listener will not fire until the NEXT
+                    # transaction, so we need this explicit call for the first one.
+                    await session.execute(text(set_path_sql))
+                    logger.debug("search_path → %r (tenant %s) [initial]", schema, tenant.id)
+                    yield session
+                except IsolationError:
+                    raise
+                except Exception as exc:
+                    await session.rollback()
+                    raise IsolationError(
+                        operation="get_session",
+                        tenant_id=tenant.id,
+                        details={"schema": schema, "error": str(exc)},
+                    ) from exc
+                finally:
+                    # Remove the listener while the session object is still
+                    # alive so the event system releases its reference cleanly.
+                    if event.contains(session.sync_session, "after_begin", _after_begin):
+                        event.remove(session.sync_session, "after_begin", _after_begin)
+        except IsolationError:
+            raise
+        except Exception as exc:
+            # Wrap any session-construction errors that escaped the inner try.
+            raise IsolationError(
+                operation="get_session",
+                tenant_id=tenant.id,
+                details={"schema": schema, "error": str(exc)},
+            ) from exc
 
     @asynccontextmanager
     async def _mssql_schema_session(self, tenant: Tenant) -> AsyncIterator[AsyncSession]:
@@ -751,14 +818,28 @@ class SchemaIsolationProvider(BaseIsolationProvider):
             assert_safe_schema_name(schema, context=f"destroy_tenant tenant={tenant.id!r}")
             async with self.engine.begin() as conn:
                 try:
-                    # MSSQL uses bracket quoting; no IF EXISTS on DROP SCHEMA in older versions.
-                    # Tables inside the schema must be dropped first.
+                    # Drop all tables in the schema before dropping the schema
+                    # itself.  MSSQL has no CASCADE on DROP SCHEMA.
+                    #
+                    # QUOTENAME() wraps each identifier in [brackets], providing
+                    # defence-in-depth against injection even though
+                    # assert_safe_schema_name already validates the schema name.
+                    # :schema is passed as a bound parameter to the outer query
+                    # (WHERE TABLE_SCHEMA = :schema) — the only place the value
+                    # crosses the parameterisation boundary.
                     await conn.execute(
                         text(
-                            "DECLARE @sql NVARCHAR(MAX) = '';"
-                            "SELECT @sql = @sql + 'DROP TABLE [' + :schema + '].[' + TABLE_NAME + '];' "  # noqa: E501
-                            "FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :schema;"
-                            "EXEC sp_executesql @sql"
+                            "DECLARE @sql NVARCHAR(MAX) = N'';"
+                            "SELECT @sql = @sql"
+                            "  + N'DROP TABLE '"
+                            "  + QUOTENAME(TABLE_SCHEMA)"
+                            "  + N'.'"
+                            "  + QUOTENAME(TABLE_NAME)"
+                            "  + N';' "
+                            "FROM INFORMATION_SCHEMA.TABLES "
+                            "WHERE TABLE_SCHEMA = :schema "
+                            "  AND TABLE_TYPE = N'BASE TABLE';"
+                            "IF LEN(@sql) > 0 EXEC sp_executesql @sql;"
                         ),
                         {"schema": schema},
                     )

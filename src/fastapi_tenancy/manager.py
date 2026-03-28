@@ -58,6 +58,8 @@ Custom audit log writer::
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -364,8 +366,8 @@ class TenancyManager:
             from fastapi_tenancy.cache.tenant_cache import TenantCache  # noqa: PLC0415
 
             self._l1_cache = TenantCache(
-                max_size=getattr(config, "l1_cache_max_size", 1000),
-                ttl=getattr(config, "l1_cache_ttl_seconds", 60),
+                max_size=config.l1_cache_max_size,
+                ttl=config.l1_cache_ttl_seconds,
             )
             _effective_store = _CachingStoreProxy(store, self._l1_cache)
             logger.info(
@@ -386,6 +388,11 @@ class TenancyManager:
         )
         self._rate_limiter: Any = None  # Lazy-initialised from Redis.
         self._rate_limiting_enabled: bool = config.enable_rate_limiting
+
+        # Background task that periodically evicts expired L1 cache entries.
+        # Initialised to None here; started by initialize() when the cache is
+        # enabled; cancelled by close() on shutdown.
+        self._purge_task: asyncio.Task[None] | None = None
 
         # Field-level encryption — None when enable_encryption=False.
         from fastapi_tenancy.utils.encryption import TenancyEncryption  # noqa: PLC0415
@@ -412,9 +419,12 @@ class TenancyManager:
         lifespan context manager.  It:
 
         1. Initialises the store (creates tables if applicable).
-        2. Warms the cache when configured.
+        2. Warms the Redis cache when configured.
+        3. Starts the L1 cache background purge task (when cache is enabled).
+        4. Establishes the Redis rate-limiter connection (when rate limiting is enabled).
 
-        Safe to call multiple times (all operations are idempotent).
+        Safe to call multiple times — all operations are idempotent.  A second
+        call while the purge task is already running will not start a duplicate.
         """
         if hasattr(self.store, "initialize"):
             await self.store.initialize()
@@ -426,6 +436,20 @@ class TenancyManager:
 
         if self._l1_cache is not None:
             logger.info("L1 in-process tenant cache active")
+            # Start the background purge task only when it is not already running.
+            # The task runs every half-TTL interval so that on average no entry
+            # survives longer than 1.5x its configured TTL in memory.  This is
+            # a best-effort sweep — lazy eviction on access is still the primary
+            # mechanism; the task merely reclaims memory in low-traffic processes.
+            if self._purge_task is None or self._purge_task.done():
+                self._purge_task = asyncio.create_task(
+                    self._run_cache_purge_loop(),
+                    name="fastapi-tenancy:l1-cache-purge",
+                )
+                logger.info(
+                    "L1 cache purge task started (interval=%ds)",
+                    max(1, self.config.l1_cache_ttl_seconds // 2),
+                )
 
         if self.config.enable_rate_limiting and self.config.redis_url:
             await self._init_rate_limiter()
@@ -436,13 +460,23 @@ class TenancyManager:
         """Dispose all resources.
 
         Call this inside a FastAPI lifespan ``finally`` block or on SIGTERM.
-        Disposes engine pools and closes Redis connections.
+        Disposes engine pools, closes Redis connections, and cancels the
+        background L1 cache purge task.
 
         Both ``isolation_provider.close()`` and ``store.close()`` are called
         unconditionally — ``TenantStore`` now declares a concrete no-op
         ``close()`` that subclasses override when they hold external resources,
         so the old ``hasattr`` guard is no longer necessary.
         """
+        # Cancel the background purge task first so it cannot reference the
+        # cache after the store is closed.
+        if self._purge_task is not None and not self._purge_task.done():
+            self._purge_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._purge_task
+            logger.info("L1 cache purge task cancelled")
+        self._purge_task = None
+
         if hasattr(self.isolation_provider, "close"):
             await self.isolation_provider.close()
         logger.info("Isolation provider closed")
@@ -668,6 +702,49 @@ class TenancyManager:
             await self.store.delete(tenant_id)
             logger.warning("Hard-deleted tenant %s", tenant_id)
 
+    ##########################
+    # L1 cache purge loop    #
+    ##########################
+
+    async def _run_cache_purge_loop(self) -> None:
+        """Periodically evict expired entries from the L1 TenantCache.
+
+        Runs as a long-lived background ``asyncio.Task`` created by
+        :meth:`initialize` and cancelled by :meth:`close`.
+
+        Design decisions
+        ----------------
+        **Interval** — ``max(1, l1_cache_ttl_seconds // 2)`` seconds.
+        This ensures that on average, an expired entry survives at most
+        ``1.5 * TTL`` in memory rather than up to ``2 * TTL`` if the purge
+        ran at the same interval as the TTL.  The ``max(1, ...)`` guard
+        prevents a zero-second tight loop for very short TTLs in tests.
+
+        **Lazy eviction is still primary** — every cache *read* already
+        evicts stale entries on access.  This loop is a secondary sweep
+        that reclaims memory in low-traffic applications where hot tenants
+        are accessed infrequently enough that stale entries accumulate.
+
+        **CancelledError** — ``asyncio.sleep`` is a cancellation point.
+        When ``close()`` cancels this task the ``CancelledError`` propagates
+        cleanly out of the ``while True`` loop; no try/except is needed here
+        because the caller (``close``) already awaits with a try/except.
+
+        Raises:
+            asyncio.CancelledError: When the task is cancelled by ``close()``.
+        """
+        if self._l1_cache is None:
+            return
+
+        interval = max(1, self.config.l1_cache_ttl_seconds // 2)
+        logger.debug("L1 purge loop running every %ds", interval)
+
+        while True:
+            await asyncio.sleep(interval)
+            evicted = self._l1_cache.purge_expired()
+            if evicted:
+                logger.debug("L1 cache purge: evicted %d expired entries", evicted)
+
     #################
     # Rate limiting #
     #################
@@ -692,19 +769,29 @@ class TenancyManager:
     # off-by-one window where concurrent requests at the exact boundary could
     # all read count = limit-1, all pass, and then all add, breaching the limit.
     #
+    # Fix — unique member per request:
+    # The original script used `now` (a float) as *both* the sorted-set score
+    # and the member string.  Two requests arriving within the same microsecond
+    # produce the same float value; the second ZADD call silently overwrites
+    # the first member rather than adding a new one, under-counting the window
+    # and allowing an extra request to slip through.  Using a UUID-suffixed
+    # member guarantees uniqueness regardless of timestamp resolution.
+    #
     # Script arguments:
     #   KEYS[1]  — sorted-set key for this tenant
-    #   ARGV[1]  — current timestamp (float, seconds)
-    #   ARGV[2]  — window start timestamp (float, seconds)
+    #   ARGV[1]  — current timestamp (float, seconds) — used as ZADD score
+    #   ARGV[2]  — window start timestamp (float, seconds) — eviction boundary
     #   ARGV[3]  — rate limit (integer)
     #   ARGV[4]  — window size in seconds (integer, for EXPIRE)
+    #   ARGV[5]  — unique request identifier (timestamp:uuid4 string) — member
     #
-    # Returns: the request count AFTER this request (1 = allowed, >limit = denied).
+    # Returns: the request count AFTER this request (1 = first allowed, >limit = denied).
     _RATE_LIMIT_LUA = """local key        = KEYS[1]
 local now        = tonumber(ARGV[1])
 local win_start  = tonumber(ARGV[2])
 local limit      = tonumber(ARGV[3])
 local window     = tonumber(ARGV[4])
+local member     = ARGV[5]
 
 -- 1. Evict entries older than the window.
 redis.call('ZREMRANGEBYSCORE', key, '-inf', win_start)
@@ -717,11 +804,13 @@ if count >= limit then
     return count
 end
 
--- 4. Add this request and refresh the key TTL.
-redis.call('ZADD', key, now, now)
+-- 4. Add this request with a unique member and refresh the key TTL.
+--    score=now for time-based eviction; member=unique so concurrent requests
+--    at the same timestamp each produce a distinct sorted-set entry.
+redis.call('ZADD', key, now, member)
 redis.call('EXPIRE', key, window)
 
--- 5. Return the new count (will be ≤ limit).
+-- 5. Return the new count (will be <= limit).
 return count + 1
 """
 
@@ -737,6 +826,10 @@ return count + 1
         The Lua script is atomic — Redis executes it without interleaving any
         other commands — so the check-and-increment is always consistent.
 
+        Each call generates a unique member string (``"{now}:{uuid4}"``) so
+        that two requests arriving within the same microsecond each add a
+        distinct sorted-set entry rather than overwriting each other.
+
         Args:
             tenant: The tenant whose rate limit to check.
 
@@ -747,12 +840,16 @@ return count + 1
             return
 
         import time  # noqa: PLC0415
+        import uuid  # noqa: PLC0415
 
         key = f"tenancy:ratelimit:{tenant.id}"
         window = self.config.rate_limit_window_seconds
         limit = self.config.rate_limit_per_minute
         now = time.time()
         window_start = now - window
+        # Unique member: timestamp prefix for human readability, uuid4 suffix
+        # to guarantee per-request uniqueness within the same microsecond.
+        member = f"{now}:{uuid.uuid4().hex}"
 
         try:
             count: int = await self._rate_limiter.eval(
@@ -763,6 +860,7 @@ return count + 1
                 window_start,
                 limit,
                 window,
+                member,
             )
             if count > limit:
                 raise RateLimitExceededError(  # noqa: TRY301

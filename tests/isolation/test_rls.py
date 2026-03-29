@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -9,7 +10,7 @@ import sqlalchemy as sa
 
 from fastapi_tenancy.core.config import TenancyConfig
 from fastapi_tenancy.core.exceptions import ConfigurationError, IsolationError
-from fastapi_tenancy.core.types import IsolationStrategy, Tenant
+from fastapi_tenancy.core.types import IsolationStrategy, Tenant, TenantStatus
 from fastapi_tenancy.isolation.rls import _RLS_GUC, _TENANT_COLUMN, RLSIsolationProvider
 
 if TYPE_CHECKING:
@@ -42,6 +43,23 @@ def _sqlite_cfg() -> TenancyConfig:
         database_pool_timeout=10,
         database_pool_recycle=300,
         database_pool_pre_ping=False,
+    )
+
+
+def _make_tenant(
+    *,
+    tenant_id: str = "t-fix-001",
+    identifier: str = "fix-tenant",
+    status: TenantStatus = TenantStatus.ACTIVE,
+) -> Tenant:
+    now = datetime.now(UTC)
+    return Tenant(
+        id=tenant_id,
+        identifier=identifier,
+        name=identifier.title(),
+        status=status,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -285,3 +303,134 @@ class TestRLSPostgresIntegration:
     ) -> None:
         t = make_tenant()
         assert await pg_rls_provider.verify_isolation(t) is True
+
+
+@pytest.mark.integration
+class TestRLSListenerCleanup:
+    """FIX: RLS begin listener removed from DBAPI connection before pool return.
+
+    Before the fix:
+        ``@event.listens_for(sync_conn, "begin")`` used the decorator form,
+        which never removes the listener.  When the physical connection was
+        returned to the pool and reused for a different tenant, the stale
+        listener fired at the start of the new transaction — silently setting
+        the GUC to the old tenant's ID.
+
+    After the fix:
+        The listener function is defined as a named local, registered with
+        ``event.listen``, and removed with ``event.remove`` in a ``finally``
+        block that wraps the entire session lifetime (including the
+        ``AsyncSession()`` constructor call).
+    """
+
+    def _make_pg_rls_provider(self) -> Any:
+        """Return an RLSIsolationProvider backed by a real PG, or skip."""
+        import os  # noqa: PLC0415
+        import socket  # noqa: PLC0415
+
+        pg_url = os.getenv(
+            "POSTGRES_URL",
+            "postgresql+asyncpg://testing:Testing123!@localhost:5432/test_db",
+        )
+        try:
+            host = pg_url.split("@")[1].split("/")[0].split(":")[0]
+            port = (
+                int(pg_url.split("@")[1].split("/")[0].split(":")[1])
+                if ":" in pg_url.split("@")[1].split("/")[0]
+                else 5432
+            )
+            with socket.create_connection((host, port), timeout=1):
+                pass
+        except OSError:
+            pytest.skip("PostgreSQL not reachable — skipping RLS listener test")
+
+        from fastapi_tenancy.isolation.rls import RLSIsolationProvider  # noqa: PLC0415
+
+        cfg = TenancyConfig(
+            database_url=pg_url,
+            isolation_strategy=IsolationStrategy.RLS,
+            schema_prefix="t_",
+            database_echo=False,
+            database_pool_size=2,
+            database_max_overflow=2,
+            database_pool_timeout=10,
+            database_pool_recycle=300,
+            database_pool_pre_ping=False,
+        )
+        return RLSIsolationProvider(cfg)
+
+    async def test_listener_removed_after_normal_close(self) -> None:
+        """After get_session exits normally, no begin listener remains on sync_conn."""
+
+        provider = self._make_pg_rls_provider()
+        tenant = _make_tenant()
+
+        captured_sync_conn: list[Any] = []
+
+        async with provider.get_session(tenant) as session:
+            conn = await session.connection()
+            captured_sync_conn.append(conn.sync_connection)
+
+        sync_conn = captured_sync_conn[0]
+
+        # After the session closes, no _set_rls_guc listener should remain.
+        remaining = [
+            fn
+            for fn in getattr(sync_conn.dispatch, "begin", [])
+            if "_set_rls_guc" in getattr(fn, "__qualname__", "")
+        ]
+        assert remaining == [], f"RLS GUC listener leaked after normal session close: {remaining}"
+        await provider.close()
+
+    async def test_listener_removed_after_exception(self) -> None:
+        """After get_session exits via exception, no begin listener remains."""
+
+        provider = self._make_pg_rls_provider()
+        tenant = _make_tenant()
+        captured_sync_conn: list[Any] = []
+
+        with pytest.raises(IsolationError):  # noqa: PT012
+            async with provider.get_session(tenant) as session:
+                conn = await session.connection()
+                captured_sync_conn.append(conn.sync_connection)
+                raise RuntimeError("handler blew up")
+
+        if captured_sync_conn:
+            sync_conn = captured_sync_conn[0]
+            remaining = [
+                fn
+                for fn in getattr(sync_conn.dispatch, "begin", [])
+                if "_set_rls_guc" in getattr(fn, "__qualname__", "")
+            ]
+            assert remaining == [], f"RLS GUC listener leaked after exception: {remaining}"
+        await provider.close()
+
+    async def test_guc_not_reused_across_tenants(self) -> None:
+        """A connection reused from the pool must not carry a stale tenant GUC.
+
+        Opens session for tenant A, closes it (connection returns to pool),
+        then opens session for tenant B on the same connection and verifies
+        the GUC reflects B's ID — not A's.
+        """
+        provider = self._make_pg_rls_provider()
+        t_a = _make_tenant(tenant_id="t-rls-a", identifier="rls-alpha")
+        t_b = _make_tenant(tenant_id="t-rls-b", identifier="rls-beta")
+
+        async with provider.get_session(t_a) as session:
+            result = await session.execute(
+                sa.text("SELECT current_setting('app.current_tenant', TRUE)")
+            )
+            assert result.scalar() == t_a.id
+
+        # Reuse the connection for tenant B.
+        async with provider.get_session(t_b) as session:
+            result = await session.execute(
+                sa.text("SELECT current_setting('app.current_tenant', TRUE)")
+            )
+            guc_value = result.scalar()
+            assert guc_value == t_b.id, (
+                f"Pool connection carried stale GUC from tenant A ({t_a.id!r}); "
+                f"got {guc_value!r} instead of {t_b.id!r}"
+            )
+
+        await provider.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -14,7 +15,7 @@ from fastapi_tenancy.core.context import (
     tenant_scope,
 )
 from fastapi_tenancy.core.exceptions import TenantNotFoundError
-from fastapi_tenancy.core.types import Tenant
+from fastapi_tenancy.core.types import Tenant, TenantStatus
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -28,6 +29,23 @@ def tenant() -> Tenant:
 @pytest.fixture
 def other_tenant() -> Tenant:
     return Tenant(id="ctx-t2", identifier="ctx-globex", name="Ctx Globex")
+
+
+def _make_tenant(
+    *,
+    tenant_id: str = "t-fix-001",
+    identifier: str = "fix-tenant",
+    status: TenantStatus = TenantStatus.ACTIVE,
+) -> Tenant:
+    now = datetime.now(UTC)
+    return Tenant(
+        id=tenant_id,
+        identifier=identifier,
+        name=identifier.title(),
+        status=status,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -199,3 +217,146 @@ class TestFastAPIDependencies:
     async def test_get_current_tenant_optional_returns_tenant(self, tenant: Tenant) -> None:
         TenantContext.set(tenant)
         assert get_current_tenant_optional() == tenant
+
+
+class TestContextClearReturnsTokens:
+    """FIX: clear() returns (tenant_token, metadata_token); reset_all() restores state.
+
+    Before the fix:
+        ``clear()`` called ``_tenant_ctx.set(None)`` and ``_metadata_ctx.set(None)``
+        and returned ``None``.  The tokens produced by those set() calls were
+        discarded immediately, making it *impossible* to restore the previous state.
+        In nested scopes (e.g. a test fixture clearing context inside a
+        ``tenant_scope`` block), the outer tenant would be permanently erased
+        from the perspective of any code that later called ``reset(token)``.
+
+        ``clear_metadata()`` had the same problem for the metadata variable.
+
+    After the fix:
+        Both methods return their tokens.  ``reset_all(tenant_token, meta_token)``
+        restores both variables to exactly the state that existed before the clear.
+        Existing callers that ignore the return value are unaffected.
+    """
+
+    def setup_method(self) -> None:
+        """Start each test with a clean context."""
+        TenantContext.clear()
+
+    def teardown_method(self) -> None:
+        """Leave a clean context after each test."""
+        TenantContext.clear()
+
+    def test_clear_returns_two_tokens(self) -> None:
+        """clear() must return a 2-tuple of Token objects."""
+        from contextvars import Token  # noqa: PLC0415
+
+        result = TenantContext.clear()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        tenant_token, meta_token = result
+        assert isinstance(tenant_token, Token)
+        assert isinstance(meta_token, Token)
+
+    def test_clear_still_clears_both(self) -> None:
+        """clear() must still clear both variables (backward compatibility)."""
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+        TenantContext.set_metadata("key", "value")
+
+        TenantContext.clear()
+
+        assert TenantContext.get_optional() is None
+        assert TenantContext.get_all_metadata() == {}
+
+    def test_reset_all_restores_tenant(self) -> None:
+        """reset_all() must restore the tenant that was active before clear()."""
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+
+        tokens = TenantContext.clear()
+        assert TenantContext.get_optional() is None  # cleared
+
+        TenantContext.reset_all(*tokens)
+        assert TenantContext.get_optional() == tenant  # restored
+
+    def test_reset_all_restores_metadata(self) -> None:
+        """reset_all() must restore metadata that was active before clear()."""
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+        TenantContext.set_metadata("plan", "enterprise")
+        TenantContext.set_metadata("seats", 100)
+
+        tokens = TenantContext.clear()
+        assert TenantContext.get_all_metadata() == {}  # cleared
+
+        TenantContext.reset_all(*tokens)
+        assert TenantContext.get_metadata("plan") == "enterprise"
+        assert TenantContext.get_metadata("seats") == 100
+
+    def test_reset_all_is_safe_when_nothing_was_set(self) -> None:
+        """reset_all() from a blank context must not raise."""
+        tokens = TenantContext.clear()  # already blank
+        TenantContext.reset_all(*tokens)  # must not raise
+        assert TenantContext.get_optional() is None
+
+    def test_nested_clear_and_reset_all(self) -> None:
+        """Nested clear/reset_all must correctly restore the outer tenant."""
+        outer = _make_tenant(tenant_id="t-outer", identifier="outer-tenant")
+        inner = _make_tenant(tenant_id="t-inner", identifier="inner-tenant")
+
+        # Set outer tenant.
+        outer_token = TenantContext.set(outer)
+        assert TenantContext.get_optional() == outer
+
+        # Clear inside a nested block, set inner tenant, then restore.
+        saved_tokens = TenantContext.clear()
+        assert TenantContext.get_optional() is None
+
+        TenantContext.set(inner)
+        assert TenantContext.get_optional() == inner
+
+        TenantContext.reset_all(*saved_tokens)
+        assert TenantContext.get_optional() == outer  # outer is back
+
+        # Now restore the original pre-outer state.
+        TenantContext.reset(outer_token)
+        assert TenantContext.get_optional() is None
+
+    def test_clear_metadata_returns_token(self) -> None:
+        """clear_metadata() must return a Token for the metadata variable."""
+        from contextvars import Token  # noqa: PLC0415
+
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+        TenantContext.set_metadata("x", 1)
+
+        token = TenantContext.clear_metadata()
+
+        assert isinstance(token, Token)
+        # Metadata is cleared.
+        assert TenantContext.get_metadata("x") is None
+        # Tenant is untouched.
+        assert TenantContext.get_optional() == tenant
+
+    def test_clear_metadata_token_restores_metadata(self) -> None:
+        """The token from clear_metadata() must allow restoring previous metadata."""
+        from fastapi_tenancy.core.context import _metadata_ctx  # noqa: PLC0415
+
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+        TenantContext.set_metadata("key", "original")
+
+        token = TenantContext.clear_metadata()
+        assert TenantContext.get_metadata("key") is None
+
+        _metadata_ctx.reset(token)
+        assert TenantContext.get_metadata("key") == "original"
+
+    def test_existing_callers_ignoring_return_value_still_work(self) -> None:
+        """Code that ignores clear()'s return value must continue to work."""
+        tenant = _make_tenant()
+        TenantContext.set(tenant)
+
+        TenantContext.clear()  # return value intentionally ignored
+
+        assert TenantContext.get_optional() is None  # still cleared

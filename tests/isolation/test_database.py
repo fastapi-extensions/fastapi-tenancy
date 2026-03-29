@@ -5,6 +5,8 @@ the :class:`~fastapi_tenancy.isolation.database._LRUEngineCache`.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+import gc
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from fastapi_tenancy.core.config import TenancyConfig
 from fastapi_tenancy.core.exceptions import IsolationError
-from fastapi_tenancy.core.types import IsolationStrategy, Tenant
+from fastapi_tenancy.core.types import IsolationStrategy, Tenant, TenantStatus
 from fastapi_tenancy.isolation.database import DatabaseIsolationProvider, _LRUEngineCache
 from fastapi_tenancy.utils.db_compat import DbDialect
 
@@ -40,6 +42,23 @@ def _db_cfg(url: str = "sqlite+aiosqlite:///:memory:", **kw: Any) -> TenancyConf
         database_pool_recycle=300,
         database_pool_pre_ping=False,
         **kw,
+    )
+
+
+def _make_tenant(
+    *,
+    tenant_id: str = "t-fix-001",
+    identifier: str = "fix-tenant",
+    status: TenantStatus = TenantStatus.ACTIVE,
+) -> Tenant:
+    now = datetime.now(UTC)
+    return Tenant(
+        id=tenant_id,
+        identifier=identifier,
+        name=identifier.title(),
+        status=status,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -528,4 +547,109 @@ class TestConcurrentEngineCreation:
         tenants = [make_tenant(identifier=f"multi-{i}") for i in range(10)]
         engines = await asyncio.gather(*[provider._get_engine(t) for t in tenants])
         assert len({id(e) for e in engines}) == 10
+        await provider.close()
+
+
+@pytest.mark.integration
+class TestCreationLocksWeakValueDictionary:
+    """FIX: _creation_locks uses WeakValueDictionary for automatic GC cleanup.
+
+    Before the fix:
+        A plain ``dict[str, asyncio.Lock]`` was used.  Manual ``pop`` calls
+        cleaned up on success and failure, but edge cases (concurrent failures,
+        engine creation that raised mid-pool-construction) could leave entries
+        permanently.
+
+    After the fix:
+        ``WeakValueDictionary`` entries are collected automatically when no
+        strong reference exists.  The local ``tenant_lock`` variable in
+        ``_get_engine`` keeps the lock alive for the critical section duration.
+    """
+
+    async def test_lock_absent_after_successful_creation(self) -> None:
+        """After engine creation succeeds, the lock entry is GC'd."""
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = _make_tenant(tenant_id="t-wvd-01", identifier="wvd-success")
+        try:
+            await provider._get_engine(tenant)
+            gc.collect()
+            assert tenant.id not in provider._creation_locks
+        finally:
+            await provider.close()
+
+    async def test_lock_absent_after_creation_failure(self) -> None:
+        """After engine creation fails, the lock entry is GC'd."""
+        import gc as _gc  # noqa: PLC0415
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = _make_tenant(tenant_id="t-wvd-02", identifier="wvd-fail")
+
+        with (
+            patch(
+                "fastapi_tenancy.isolation.database.create_async_engine",
+                side_effect=RuntimeError("simulated"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await provider._get_engine(tenant)
+
+        _gc.collect()
+        assert tenant.id not in provider._creation_locks
+        await provider.close()
+
+    async def test_retry_after_failure_succeeds(self) -> None:
+        """A second call after a failed first call must succeed without errors."""
+        call_count = 0
+        real_create = __import__(
+            "fastapi_tenancy.isolation.database", fromlist=["create_async_engine"]
+        ).create_async_engine
+
+        def _failing_then_ok(url: str, **kw: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("first attempt fails")
+            return real_create(url, **kw)
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = _make_tenant(tenant_id="t-wvd-03", identifier="wvd-retry")
+
+        with (
+            patch(
+                "fastapi_tenancy.isolation.database.create_async_engine",
+                side_effect=_failing_then_ok,
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await provider._get_engine(tenant)
+
+        # Second attempt — must not be blocked by a stale lock.
+        engine = await provider._get_engine(tenant)
+        assert engine is not None
+        await provider.close()
+
+    async def test_concurrent_calls_produce_single_engine(self) -> None:
+        """Concurrent first-requests for the same tenant must produce exactly one engine."""
+        provider = DatabaseIsolationProvider(_db_cfg())
+        tenant = _make_tenant(tenant_id="t-wvd-04", identifier="wvd-concurrent")
+
+        engines = await asyncio.gather(
+            provider._get_engine(tenant),
+            provider._get_engine(tenant),
+            provider._get_engine(tenant),
+        )
+
+        # All three calls must return the same engine object.
+        assert engines[0] is engines[1]
+        assert engines[1] is engines[2]
+        assert provider._engine_cache.size == 1
+
+        await provider.close()
+
+    async def test_dict_is_weak_value_dictionary(self) -> None:
+        """_creation_locks must be a WeakValueDictionary instance."""
+        import weakref  # noqa: PLC0415
+
+        provider = DatabaseIsolationProvider(_db_cfg())
+        assert isinstance(provider._creation_locks, weakref.WeakValueDictionary)
         await provider.close()

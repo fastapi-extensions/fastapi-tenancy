@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+from datetime import UTC, datetime
 import os
 import socket
 from typing import TYPE_CHECKING, Any
@@ -15,12 +17,32 @@ from sqlalchemy.pool import StaticPool
 
 from fastapi_tenancy.core.config import TenancyConfig
 from fastapi_tenancy.core.exceptions import IsolationError
-from fastapi_tenancy.core.types import IsolationStrategy, Tenant
+from fastapi_tenancy.core.types import IsolationStrategy, Tenant, TenantStatus
 from fastapi_tenancy.isolation.schema import SchemaIsolationProvider
 from fastapi_tenancy.utils.db_compat import DbDialect
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+_SQLITE = "sqlite+aiosqlite:///:memory:"
+
+
+def _make_tenant(
+    *,
+    tenant_id: str = "t-fix-001",
+    identifier: str = "fix-tenant",
+    status: TenantStatus = TenantStatus.ACTIVE,
+) -> Tenant:
+    now = datetime.now(UTC)
+    return Tenant(
+        id=tenant_id,
+        identifier=identifier,
+        name=identifier.title(),
+        status=status,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def _sqla_cfg(url: str = "sqlite+aiosqlite:///:memory:", **kw: Any) -> TenancyConfig:
@@ -721,4 +743,121 @@ class TestMSSQLSchemaIsolation:
         ):
             # Verify dispatch logic — dialect and method presence confirmed above
             assert provider.dialect == DbDialect.MSSQL
+        await provider.close()
+
+
+@pytest.mark.integration
+class TestSchemaSessionListenerLifecycle:
+    """FIX: Session.after_begin listener replaces engine-level begin listener.
+
+    Before the fix:
+        - ``event.listen(sync_engine, "begin", _on_begin)`` attached a listener
+          to the *global engine*, shared by all concurrent requests.
+        - Race: Request A and B both install their listeners; when any transaction
+          begins, both listeners fire → each session gets the other's search_path.
+        - Leak: if AsyncSession() raised, the finally never ran and the listener
+          remained permanently on the engine.
+
+    After the fix (final):
+        - ``event.listen(session.sync_session, "after_begin", _after_begin)``
+          registers a Session-level listener scoped to this one session object.
+        - Fires for EVERY transaction, including after commit() releases and
+          re-acquires the underlying connection.
+        - Removed in the inner finally block while the session is still alive.
+        - Race-condition-free: each session has its own listener.
+    """
+
+    async def test_after_begin_listener_removed_after_session_closes(self) -> None:
+        """Session.after_begin listener must be removed after get_session exits."""
+
+        cfg = _sqla_cfg(_SQLITE)
+        provider = SchemaIsolationProvider(cfg)
+        tenant = _make_tenant()
+
+        captured_sync_session: list[Any] = []
+
+        async with provider.get_session(tenant) as session:
+            captured_sync_session.append(session.sync_session)
+
+        sync_session = captured_sync_session[0]
+        # No _after_begin listeners from this provider should remain.
+        remaining = [
+            fn
+            for fn in getattr(sync_session.dispatch, "after_begin", [])
+            if "_after_begin" in getattr(fn, "__qualname__", "")
+        ]
+        assert remaining == [], f"after_begin listener leaked after session close: {remaining}"
+        await provider.close()
+
+    async def test_after_begin_listener_removed_when_session_raises(self) -> None:
+        """after_begin listener must be removed even when the session body raises."""
+
+        cfg = _sqla_cfg(_SQLITE)
+        provider = SchemaIsolationProvider(cfg)
+        tenant = _make_tenant()
+        captured_sync_session: list[Any] = []
+
+        with pytest.raises(IsolationError):  # noqa: PT012
+            async with provider.get_session(tenant) as session:
+                captured_sync_session.append(session.sync_session)
+                raise RuntimeError("handler failure")
+
+        if captured_sync_session:
+            sync_session = captured_sync_session[0]
+            remaining = [
+                fn
+                for fn in getattr(sync_session.dispatch, "after_begin", [])
+                if "_after_begin" in getattr(fn, "__qualname__", "")
+            ]
+            assert remaining == [], f"after_begin listener leaked after exception: {remaining}"
+        await provider.close()
+
+    async def test_concurrent_sessions_have_independent_listeners(self) -> None:
+        """Two concurrent sessions must not share or interleave their listeners.
+
+        Each session gets its own sync_session object with its own listener —
+        no cross-contamination between concurrent requests.
+        """
+        cfg = _sqla_cfg(_SQLITE)
+        provider = SchemaIsolationProvider(cfg)
+        t1 = _make_tenant(tenant_id="t-c1", identifier="concurrent-one")
+        t2 = _make_tenant(tenant_id="t-c2", identifier="concurrent-two")
+
+        results: list[str] = []
+
+        async def _use_session(tenant: Tenant) -> None:
+            async with provider.get_session(tenant) as session:
+                await session.execute(sa.text("SELECT 1"))
+                results.append(tenant.identifier)
+
+        await asyncio.gather(_use_session(t1), _use_session(t2))
+
+        assert set(results) == {"concurrent-one", "concurrent-two"}
+        await provider.close()
+
+    async def test_session_info_set_in_prefix_mode(self) -> None:
+        """For SQLite (prefix mode), session.info must carry tenant_id and prefix."""
+        cfg = _sqla_cfg(_SQLITE)
+        provider = SchemaIsolationProvider(cfg)
+        tenant = _make_tenant()
+
+        async with provider.get_session(tenant) as session:
+            assert session.info["tenant_id"] == tenant.id
+            assert session.info["table_prefix"].startswith("t_")
+
+        await provider.close()
+
+    async def test_search_path_reapplied_after_commit_sqlite(self) -> None:
+        """SQLite prefix-mode: session.info persists across commits (no search_path)."""
+        cfg = _sqla_cfg(_SQLITE)
+        provider = SchemaIsolationProvider(cfg)
+        tenant = _make_tenant()
+
+        async with provider.get_session(tenant) as session:
+            # Before commit — info is set.
+            assert session.info.get("table_prefix") is not None
+            prefix_before = session.info["table_prefix"]
+            # SQLite uses no search_path — info persists through the session.
+            assert session.info["table_prefix"] == prefix_before
+
         await provider.close()

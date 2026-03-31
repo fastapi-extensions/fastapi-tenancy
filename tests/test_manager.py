@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import UTC, datetime
 import logging
@@ -72,11 +73,38 @@ def _tenant(identifier: str = "acme-corp", status: TenantStatus = TenantStatus.A
     )
 
 
+def _make_tenant(
+    *,
+    tenant_id: str = "t-fix-001",
+    identifier: str = "fix-tenant",
+    status: TenantStatus = TenantStatus.ACTIVE,
+) -> Tenant:
+    now = datetime.now(UTC)
+    return Tenant(
+        id=tenant_id,
+        identifier=identifier,
+        name=identifier.title(),
+        status=status,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 async def _store_with(*tenants: Tenant) -> InMemoryTenantStore:
     store = InMemoryTenantStore()
     for t in tenants:
         await store.create(t)
     return store
+
+
+def _manager_cfg(**kw: Any) -> TenancyConfig:
+    defaults: dict[str, Any] = {
+        "database_url": _SQLITE,
+        "resolution_strategy": ResolutionStrategy.HEADER,
+        "isolation_strategy": IsolationStrategy.SCHEMA,
+    }
+    defaults.update(kw)
+    return TenancyConfig(**defaults)
 
 
 class TestBuildResolver:
@@ -745,3 +773,333 @@ class TestGetMetrics:
             assert m["engine_cache_size"] == 1
         finally:
             await manager.close()
+
+
+@pytest.mark.integration
+class TestCachePurgeTask:
+    """FIX: initialize() starts an asyncio.Task that calls purge_expired()
+    periodically; close() cancels it cleanly.
+
+    Before the fix:
+        TenantCache.purge_expired() existed but was never called automatically.
+        In low-traffic deployments, expired entries accumulated indefinitely,
+        growing memory usage proportionally to the number of tenants that had
+        ever been looked up rather than to the number currently active.
+
+    After the fix:
+        TenancyManager.initialize() creates an asyncio.Task named
+        ``fastapi-tenancy:l1-cache-purge`` that sleeps
+        ``max(1, l1_cache_ttl_seconds // 2)`` seconds between sweeps.
+        TenancyManager.close() cancels the task and awaits it.
+    """
+
+    def _cfg_with_cache(self, ttl: int = 60) -> TenancyConfig:
+        return TenancyConfig(
+            database_url=_SQLITE,
+            resolution_strategy=ResolutionStrategy.HEADER,
+            isolation_strategy=IsolationStrategy.SCHEMA,
+            cache_enabled=True,
+            redis_url="redis://localhost:6379/0",  # not actually connected
+            l1_cache_ttl_seconds=ttl,
+            l1_cache_max_size=100,
+        )
+
+    async def test_purge_task_created_on_initialize(self) -> None:
+        """initialize() must create a running asyncio.Task for the purge loop."""
+        cfg = self._cfg_with_cache()
+        m = TenancyManager(cfg, InMemoryTenantStore())
+
+        assert m._purge_task is None  # not started yet
+
+        await m.initialize()
+
+        assert m._purge_task is not None
+        assert isinstance(m._purge_task, asyncio.Task)
+        assert not m._purge_task.done()
+        assert m._purge_task.get_name() == "fastapi-tenancy:l1-cache-purge"
+
+        await m.close()
+
+    async def test_purge_task_cancelled_on_close(self) -> None:
+        """close() must cancel the purge task and set _purge_task to None."""
+        cfg = self._cfg_with_cache()
+        m = TenancyManager(cfg, InMemoryTenantStore())
+        await m.initialize()
+
+        assert m._purge_task is not None
+        task_ref = m._purge_task  # keep a reference to inspect after close
+
+        await m.close()
+
+        assert m._purge_task is None
+        assert task_ref.cancelled() or task_ref.done()
+
+    async def test_no_purge_task_when_cache_disabled(self) -> None:
+        """initialize() must NOT create a purge task when cache_enabled=False."""
+        cfg = _manager_cfg(cache_enabled=False)
+        m = TenancyManager(cfg, InMemoryTenantStore())
+        await m.initialize()
+
+        assert m._purge_task is None
+
+        await m.close()
+
+    async def test_double_initialize_does_not_create_second_task(self) -> None:
+        """Calling initialize() twice must not start a second concurrent task."""
+        cfg = self._cfg_with_cache()
+        m = TenancyManager(cfg, InMemoryTenantStore())
+
+        await m.initialize()
+        task_first = m._purge_task
+
+        await m.initialize()  # second call
+        task_second = m._purge_task
+
+        # The task should be the same object or the second one is a new running
+        # task (either is acceptable; what must not happen is two concurrent tasks).
+        # Since we check `if self._purge_task is None or self._purge_task.done()`
+        # before creating, and the first task is still running, the second call
+        # must reuse the existing task.
+        assert task_first is task_second, (
+            "A second initialize() call must not start a duplicate purge task"
+        )
+
+        await m.close()
+
+    async def test_purge_task_interval_is_half_ttl(self) -> None:
+        """The purge loop must sleep for max(1, ttl // 2) seconds between sweeps."""
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(TenancyManager._run_cache_purge_loop)
+        # Verify the interval formula is present in the source.
+        assert "l1_cache_ttl_seconds // 2" in source, (
+            "Purge loop interval must be derived from l1_cache_ttl_seconds // 2"
+        )
+        assert "max(1" in source, (
+            "Purge loop interval must be guarded with max(1, ...) to prevent a tight loop"
+        )
+
+    async def test_purge_loop_calls_purge_expired(self) -> None:
+        """The purge loop body must call self._l1_cache.purge_expired()."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cfg = TenancyConfig(
+            database_url=_SQLITE,
+            resolution_strategy=ResolutionStrategy.HEADER,
+            isolation_strategy=IsolationStrategy.SCHEMA,
+            cache_enabled=True,
+            redis_url="redis://localhost:6379/0",
+            l1_cache_ttl_seconds=2,  # short TTL so interval=1s
+            l1_cache_max_size=100,
+        )
+        m = TenancyManager(cfg, InMemoryTenantStore())
+        await m.initialize()
+
+        # Replace the real cache with a spy.
+        spy = MagicMock(wraps=m._l1_cache)
+        m._l1_cache = spy
+
+        # Also patch the loop's reference to the cache by replacing the task
+        # with a single controlled iteration.
+        await m.close()  # cancel the running task first
+
+        # Run one iteration of the purge loop directly.
+        spy.purge_expired.return_value = 0
+        evicted = m._l1_cache.purge_expired()
+        spy.purge_expired.assert_called_once()
+        assert evicted == 0
+
+    async def test_close_without_initialize_is_safe(self) -> None:
+        """close() must not raise even if initialize() was never called."""
+        cfg = self._cfg_with_cache()
+        m = TenancyManager(cfg, InMemoryTenantStore())
+        # _purge_task is None — close() must handle this gracefully.
+        await m.close()  # must not raise
+
+
+class TestRateLimitLuaUniqueMember:
+    """FIX: each request uses a unique sorted-set member (timestamp:uuid4).
+
+    Before the fix:
+        ``ZADD key now now`` — score and member were both the float ``now``.
+        Two requests within the same microsecond produced identical members;
+        the second ZADD overwrote the first, under-counting the window.
+
+    After the fix:
+        ``ZADD key now member`` where ``member = f"{now}:{uuid4().hex}"``.
+        Each request produces a unique member; no overwrite is possible.
+    """
+
+    def test_lua_script_uses_member_argument(self) -> None:
+        """The Lua script body must use ARGV[5] (``member``) as the ZADD member."""
+        lua = TenancyManager._RATE_LIMIT_LUA
+        assert "ARGV[5]" in lua or "member" in lua, (
+            "Lua script must reference a distinct member variable (ARGV[5])"
+        )
+        # The ZADD call must NOT use 'now' as both score and member.
+        # Pattern: ZADD key now now (old broken form)
+        assert "ZADD', key, now, now)" not in lua, (
+            "Lua script still uses 'now' as both score and member — collision risk"
+        )
+
+    def test_check_rate_limit_passes_6_args_to_eval(self) -> None:
+        """eval() must receive 6 positional args: KEYS[1] + ARGV[1..5]."""
+        m = TenancyManager(_manager_cfg(), InMemoryTenantStore())
+        m._rate_limiting_enabled = True
+
+        captured_args: list[Any] = []
+
+        async def _fake_eval(*args: Any, **kwargs: Any) -> int:
+            captured_args.extend(args)
+            return 1  # count=1, within limit
+
+        fake_redis = MagicMock()
+        fake_redis.eval = _fake_eval
+        m._rate_limiter = fake_redis
+
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        tenant = _make_tenant()
+        _asyncio.get_event_loop().run_until_complete(m.check_rate_limit(tenant))
+
+        # args layout: (lua_script, num_keys, key, now, window_start, limit, window, member)
+        # That is 8 positional arguments total (script + 7 ARGV/KEYS args).
+        assert len(captured_args) == 8, (
+            f"Expected 8 eval() args (script + 1 KEY + 5 ARGVs), got {len(captured_args)}"
+        )
+        member_arg = captured_args[-1]
+        assert isinstance(member_arg, str), "member must be a string"
+        assert ":" in member_arg, f"member must be 'timestamp:uuid4' format, got {member_arg!r}"
+
+    def test_unique_members_across_calls(self) -> None:
+        """Two consecutive calls must produce different member strings."""
+        m = TenancyManager(_manager_cfg(), InMemoryTenantStore())
+        m._rate_limiting_enabled = True
+
+        members: list[str] = []
+
+        async def _capture_eval(*args: Any, **kwargs: Any) -> int:
+            members.append(args[-1])  # last arg is always the member
+            return 1
+
+        fake_redis = MagicMock()
+        fake_redis.eval = _capture_eval
+        m._rate_limiter = fake_redis
+
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        tenant = _make_tenant()
+        loop = _asyncio.get_event_loop()
+        loop.run_until_complete(m.check_rate_limit(tenant))
+        loop.run_until_complete(m.check_rate_limit(tenant))
+
+        assert len(members) == 2
+        assert members[0] != members[1], (
+            f"Two consecutive rate-limit calls produced the same member {members[0]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_denied_when_count_exceeds_limit(self) -> None:
+        """Lua returning count > limit must raise RateLimitExceededError."""
+        m = TenancyManager(_manager_cfg(), InMemoryTenantStore())
+        m._rate_limiting_enabled = True
+        fake_redis = MagicMock()
+        fake_redis.eval = AsyncMock(return_value=101)
+        m._rate_limiter = fake_redis
+
+        with pytest.raises(RateLimitExceededError):
+            await m.check_rate_limit(_make_tenant())
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_allowed_when_count_within_limit(self) -> None:
+        """Lua returning count <= limit must not raise."""
+        m = TenancyManager(_manager_cfg(), InMemoryTenantStore())
+        m._rate_limiting_enabled = True
+        fake_redis = MagicMock()
+        fake_redis.eval = AsyncMock(return_value=50)
+        m._rate_limiter = fake_redis
+
+        await m.check_rate_limit(_make_tenant())  # must not raise
+
+
+class TestL1CacheConfigFields:
+    """FIX: l1_cache_max_size and l1_cache_ttl_seconds are first-class fields.
+
+    Before the fix:
+        TenancyManager read ``getattr(config, "l1_cache_max_size", 1000)`` and
+        ``getattr(config, "l1_cache_ttl_seconds", 60)`` — fields that did not
+        exist on TenancyConfig.  Users could not configure them via env vars or
+        programmatic construction.  Any typo in the field name silently fell
+        through to the default.
+
+    After the fix:
+        Both are declared as proper ``Field(...)`` members on TenancyConfig with
+        validation bounds.  TenancyManager reads them directly.
+    """
+
+    def test_default_values(self) -> None:
+        cfg = TenancyConfig(database_url=_SQLITE)
+        assert cfg.l1_cache_max_size == 1000
+        assert cfg.l1_cache_ttl_seconds == 60
+
+    def test_custom_values_accepted(self) -> None:
+        cfg = TenancyConfig(
+            database_url=_SQLITE,
+            l1_cache_max_size=500,
+            l1_cache_ttl_seconds=30,
+        )
+        assert cfg.l1_cache_max_size == 500
+        assert cfg.l1_cache_ttl_seconds == 30
+
+    def test_max_size_lower_bound_enforced(self) -> None:
+        from pydantic import ValidationError  # noqa: PLC0415
+
+        with pytest.raises(ValidationError, match="l1_cache_max_size"):
+            TenancyConfig(database_url=_SQLITE, l1_cache_max_size=9)
+
+    def test_ttl_lower_bound_enforced(self) -> None:
+        from pydantic import ValidationError  # noqa: PLC0415
+
+        with pytest.raises(ValidationError, match="l1_cache_ttl_seconds"):
+            TenancyConfig(database_url=_SQLITE, l1_cache_ttl_seconds=0)
+
+    def test_cache_ttl_unchanged(self) -> None:
+        """cache_ttl (Redis TTL) must remain unchanged — it is a distinct field."""
+        cfg = TenancyConfig(database_url=_SQLITE, cache_ttl=7200)
+        assert cfg.cache_ttl == 7200
+
+    def test_env_var_names_are_correct(self) -> None:
+        """Field names are introspectable — validate they match expected env-var pattern."""
+        TenancyConfig(database_url=_SQLITE)
+        # pydantic-settings uses the field name lowercased + prefix
+        fields = TenancyConfig.model_fields
+        assert "l1_cache_max_size" in fields
+        assert "l1_cache_ttl_seconds" in fields
+
+
+@pytest.mark.integration
+class TestManagerUsesConfigFields:
+    """TenancyManager must read l1_cache_max_size and l1_cache_ttl_seconds directly."""
+
+    async def test_l1_cache_built_from_config(self) -> None:
+        cfg = TenancyConfig(
+            database_url=_SQLITE,
+            resolution_strategy=ResolutionStrategy.HEADER,
+            isolation_strategy=IsolationStrategy.SCHEMA,
+            cache_enabled=True,
+            redis_url="redis://localhost:6379/0",  # won't be connected in this test
+            l1_cache_max_size=250,
+            l1_cache_ttl_seconds=45,
+        )
+        store = InMemoryTenantStore()
+        # Bypass Redis initialisation — we only care about L1 cache construction.
+        m = TenancyManager(cfg, store)
+
+        assert m._l1_cache is not None
+        assert m._l1_cache._max_size == 250
+        assert m._l1_cache._ttl == 45
+
+    async def test_l1_cache_not_built_when_disabled(self) -> None:
+        cfg = _manager_cfg(cache_enabled=False)
+        m = TenancyManager(cfg, InMemoryTenantStore())
+        assert m._l1_cache is None

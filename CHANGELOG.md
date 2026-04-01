@@ -7,6 +7,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] — 2026-04-02
+
+> Concurrency hardening, PostgreSQL schema isolation correctness under multi-transaction
+> sessions, serializable metadata merges with automatic retry, L1 cache lifecycle
+> management, context-variable restoration safety, and 46 new regression tests.
+> All 5 failures found by running the full live-database test suite against v0.3.0
+> are fixed in this release.
+
+### Security
+
+**CRITICAL — Cross-tenant schema bleed under concurrent load (`isolation/schema.py`)**
+
+Three successive implementations of the `_schema_session` search-path mechanism
+were analysed and the root defects fixed:
+
+- **v0.3.0 (engine-level `begin` listener)** — `event.listen(sync_engine, "begin",
+  _on_begin)` attached a single listener to the *global engine*, shared by every
+  concurrent request. Under load, Request A's and Request B's listeners both fired on
+  every transaction begin, causing each session to silently receive the other tenant's
+  `search_path`. Additionally, the `event.listen` call preceded the `try` block, so
+  if `AsyncSession()` construction raised (e.g. pool exhausted), the listener remained
+  permanently on the engine, corrupting all subsequent connections.
+
+- **Pool `checkout`/`checkin` approach (interim)** — The asyncpg dialect wraps the raw
+  DBAPI connection in `AdaptedConnection`, which does **not** implement the SQLAlchemy
+  event interface. Attaching a `begin` listener to it raised
+  `InvalidRequestError: No such event 'begin'` on every PostgreSQL connection checkout.
+
+- **`Connection.begin` on `conn.sync_connection` (second interim)** — Correct for
+  single-transaction sessions, but broken for multi-transaction ones. With
+  `autobegin=False`, SQLAlchemy releases the physical connection back to the pool on
+  every `commit()`. The next transaction uses a *new* `Connection` object, making
+  the listener on the old object useless. The test
+  `test_search_path_reapplied_after_commit` confirmed data was invisible after commit.
+
+**Final fix — `Session.after_begin`:** The `Session.after_begin(session, transaction,
+connection)` event fires for **every** transaction the session begins, including those
+that start after `commit()` releases and re-acquires the connection. It receives the
+current `Connection` as an argument, so `SET LOCAL search_path` is always issued on
+the correct physical connection. The listener is scoped to the `session.sync_session`
+object — invisible to other sessions — and is removed in `finally`.
+
+**CRITICAL — RLS GUC listener not removed after session close (`isolation/rls.py`)**
+
+The `@event.listens_for(sync_conn, "begin")` decorator inside `get_session()` is a
+call-site decoration that **never removes the listener**. When the physical connection
+was returned to the pool and reused by a future request for a different tenant, the
+stale listener fired at the start of the new tenant's first transaction, silently
+setting `app.current_tenant` to the previous tenant's ID — a silent cross-tenant data
+read breach.
+
+**Fix:** The listener function is defined as a named local variable, registered with
+`event.listen()`, and removed with `event.remove()` in a `finally` block that wraps
+the entire session lifetime — including the `AsyncSession()` constructor call.
+`sync_conn` is initialised to `None` outside the block so the guard is safe even if
+the session never opens.
+
+### Added
+
+**`TenancyConfig` — L1 cache fields now first-class (`core/config.py`)**
+- `l1_cache_max_size: int` (default `1000`, range `10–100 000`) — maximum entries in
+  the in-process LRU cache. Configurable via `TENANCY_L1_CACHE_MAX_SIZE` env var.
+- `l1_cache_ttl_seconds: int` (default `60`, min `1`) — TTL for in-process cache
+  entries. Configurable via `TENANCY_L1_CACHE_TTL_SECONDS` env var. Previously
+  `TenancyManager` read these via `getattr(config, "l1_cache_...", fallback)` — they
+  did not exist on `TenancyConfig` and could not be set by users.
+
+**`TenancyManager` — periodic L1 cache purge task (`manager.py`)**
+- `_run_cache_purge_loop()` — background `asyncio.Task` that calls
+  `TenantCache.purge_expired()` every `max(1, l1_cache_ttl_seconds // 2)` seconds.
+  Previously `purge_expired()` existed but was never called automatically; in
+  low-traffic deployments expired entries accumulated indefinitely.
+- `initialize()` creates the task (idempotent — a second call while the task is
+  running is a no-op). The task is named `"fastapi-tenancy:l1-cache-purge"` for
+  observability in async debuggers.
+- `close()` cancels and awaits the task before disposing the store and isolation
+  provider, preventing use-after-free on the cache reference.
+
+**`TenantContext.reset_all()` (`core/context.py`)**
+- New static method `reset_all(tenant_token, metadata_token)` that calls
+  `_tenant_ctx.reset(tenant_token)` and `_metadata_ctx.reset(meta_token)` atomically.
+  Counterpart to the updated `clear()`, enabling safe nested-scope context management
+  at any call depth.
+
+### Fixed
+
+**FIX-1 — `DatabaseIsolationProvider._creation_locks` grows without bound
+(`isolation/database.py`)**
+- Replaced `dict[str, asyncio.Lock]` with `weakref.WeakValueDictionary[str,
+  asyncio.Lock]`. Entries are garbage-collected automatically when no coroutine holds
+  a live reference, bounding the dict to the number of *actively contested* tenants
+  at any moment. The local variable `tenant_lock` inside `_get_engine` keeps the lock
+  strongly referenced for the critical section, preventing premature GC between the
+  `WeakValueDictionary` lookup and acquiring the lock. All manual `pop` cleanup calls
+  removed.
+
+**FIX-2 — Metadata merge loses updates under PostgreSQL concurrent writes
+(`storage/database.py`)**
+- `_update_metadata_pg()` — the SERIALIZABLE transaction correctly aborts one of N
+  concurrent writers with `SerializationError` (pgcode `40001`). The previous
+  implementation propagated this error as `TenancyError`, making `update_metadata`
+  non-functional under any realistic write concurrency.
+- **Fix:** Retry loop — up to 5 attempts with 5 ms base exponential back-off. The
+  competing transaction has already committed by the time the error is received, so
+  retries succeed immediately in practice. Detection is class-name-based to avoid
+  a hard `asyncpg` import.
+- The three-transaction corruption-recovery pattern (optimistic attempt → reset →
+  re-merge) is replaced by a single SERIALIZABLE transaction with an inline
+  `CASE … WHEN tenant_metadata IS NULL OR … THEN '{}'::jsonb ELSE … END` guard
+  that handles NULL, empty-string, and non-JSON values server-side with no round-trip.
+
+**FIX-3 — `TenantContext.clear()` and `clear_metadata()` discard tokens
+(`core/context.py`)**
+- Both methods previously called `set(None)` and discarded the returned `Token`,
+  making it impossible to restore the previous state. In nested scopes — a test
+  fixture inside a `tenant_scope`, background tasks, or middleware wrapping an
+  outer tenant scope — the outer tenant was permanently erased.
+- **Fix:** `clear()` now returns `(tenant_token, metadata_token)`. `clear_metadata()`
+  returns its `Token`. Existing callers that ignore return values are unaffected.
+
+**FIX-4 — `TenancyManager` reads L1 cache config via fragile `getattr` fallback
+(`manager.py`)**
+- `TenancyManager.__init__` previously used `getattr(config, "l1_cache_max_size",
+  1000)` and `getattr(config, "l1_cache_ttl_seconds", 60)`. These fields did not
+  exist on `TenancyConfig`. Users could not configure them via environment variables
+  or programmatic construction, and any typo in the field name silently fell through
+  to the hardcoded default.
+- **Fix:** Both fields added to `TenancyConfig` (see Added above). `TenancyManager`
+  now reads `config.l1_cache_max_size` and `config.l1_cache_ttl_seconds` directly.
+
+**FIX-5 — MSSQL `destroy_tenant` dynamic SQL uses raw string concatenation
+(`isolation/schema.py`)**
+- The T-SQL block that drops all tables in a schema before dropping the schema itself
+  previously used `'DROP TABLE [' + :schema + '].[' + TABLE_NAME + '];'` — raw string
+  concatenation for `TABLE_NAME` with no quoting.
+- **Fix:** Replaced with `QUOTENAME(TABLE_SCHEMA) + N'.' + QUOTENAME(TABLE_NAME)`.
+  Both identifiers are now bracket-quoted by SQL Server's built-in `QUOTENAME()`
+  function. `:schema` remains a bound parameter for the `WHERE TABLE_SCHEMA = :schema`
+  predicate. `AND TABLE_TYPE = N'BASE TABLE'` guard added to exclude views.
+
+**FIX-6 — Rate-limit Lua sorted-set member collision (`manager.py`)**
+- `ZADD key now now` used the float timestamp as both score and member. Two requests
+  arriving within the same microsecond produce an identical float value; the second
+  `ZADD` overwrote the first entry rather than adding a new one, under-counting the
+  window and allowing an extra request past the limit.
+- **Fix:** Each call to `check_rate_limit()` generates
+  `member = f"{now}:{uuid.uuid4().hex}"`. Score remains `now` for time-based
+  eviction; the UUID suffix guarantees per-request uniqueness. The Lua script
+  receives `member` as `ARGV[5]`.
+
+### Changed
+
+- **`TenancyConfig.cache_ttl`** — description updated to clarify this is the
+  **Redis write-through cache TTL** (SETEX expiry), distinct from
+  `l1_cache_ttl_seconds` (in-process LRU TTL). Both fields were previously conflated.
+- **`TenancyManager.initialize()`** — now starts the L1 purge background task and
+  logs its interval. Docstring updated to document all four startup steps.
+- **`TenancyManager.close()`** — cancels and awaits the purge task before disposing
+  the isolation provider and store.
+- **`TenantContext.clear()`** — return type changed from `None` to
+  `tuple[Token[Tenant | None], Token[dict[str, Any] | None]]`. Fully backward
+  compatible — existing callers that ignore the return value continue to work.
+- **`TenantContext.clear_metadata()`** — return type changed from `None` to
+  `Token[dict[str, Any] | None]`. Fully backward compatible.
+
+### Tests
+
+- **46 new regression tests** added in `tests/test_fixes.py`, each named after the
+  issue it covers and documenting the before/after behaviour.
+- **`TestSchemaSessionListenerLifecycle`** — verifies `after_begin` listener cleanup
+  on normal close, exception paths, and concurrent session independence.
+- **`TestRLSListenerCleanup`** — verifies RLS GUC listener removal and correct GUC
+  value after pool connection reuse across different tenants (PostgreSQL live-DB).
+- **`TestL1CacheConfigFields`** — validates new `TenancyConfig` field declarations,
+  bounds enforcement, and env-var naming.
+- **`TestManagerUsesConfigFields`** — confirms `TenancyManager` uses direct field
+  access, not `getattr` fallback.
+- **`TestCreationLocksWeakValueDictionary`** — confirms `_creation_locks` is a
+  `WeakValueDictionary`, entries are GC'd after success and failure, concurrent
+  callers produce exactly one engine, and retries after failure succeed.
+- **`TestUpdateMetadataSingleTransaction`** — validates normal merge and sequential
+  consistency on SQLite.
+- **`TestMSSQLDestroyTenantQuotename`** — source-level assertion that `QUOTENAME`
+  is present and old raw-concatenation pattern is absent.
+- **`TestContextClearReturnsTokens`** — covers all `clear()`/`reset_all()`/
+  `clear_metadata()` token-restoration scenarios including nested scopes.
+- **`TestCachePurgeTask`** — verifies task creation, cancellation, idempotent double-
+  initialise, interval derivation, and safe `close()` without `initialize()`.
+- **`TestRateLimitLuaUniqueMember`** — verifies ARGV[5] usage, 8-arg eval call
+  signature, and per-call member uniqueness.
+- **`tests/isolation/test_database.py`** — `TestCreationLocksLeak` updated to call
+  `gc.collect()` before asserting `WeakValueDictionary` entry absence.
+
+---
+
 ## [0.3.0] — 2026-03-20
 
 > Security hardening, field-level encryption, L1 cache wired into every request,
@@ -184,6 +379,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[0.4.0]: https://github.com/fastapi-extensions/fastapi-tenancy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fastapi-extensions/fastapi-tenancy/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fastapi-extensions/fastapi-tenancy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fastapi-extensions/fastapi-tenancy/releases/tag/v0.1.0

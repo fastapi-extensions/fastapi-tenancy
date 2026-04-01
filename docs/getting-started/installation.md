@@ -106,7 +106,7 @@ below shows the correct URL scheme for each database:
 
 ```python
 import fastapi_tenancy
-print(fastapi_tenancy.__version__)  # 0.3.0
+print(fastapi_tenancy.__version__)  # 0.4.0
 ```
 
 ## Docker Compose for local development

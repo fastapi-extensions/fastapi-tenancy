@@ -42,6 +42,7 @@ Thread / task safety
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 import logging
 import time
@@ -103,7 +104,24 @@ class TenantCache:
         self._hits: int = 0
         self._misses: int = 0
 
+        # guard all dict mutations so the cache is safe under
+        # concurrent asyncio tasks (including anyio/trio backends).
+        # Created lazily via _get_lock() to avoid needing a running event
+        # loop at __init__ time (e.g. synchronous test setup).
+        self._lock: asyncio.Lock | None = None
+
         logger.debug("TenantCache initialised max_size=%d ttl=%ds", max_size, ttl)
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Return (or lazily create) the mutation guard lock.
+
+        Lazy creation allows TenantCache to be instantiated outside an async
+        context (module load, sync test setup) while still protecting all
+        mutations once an event loop is running.
+        """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     ########
     # Read #
@@ -156,9 +174,22 @@ class TenantCache:
         When the cache is at capacity, the LRU entry is evicted before
         inserting the new entry.
 
+        Thread/task safety: all mutations are protected by ``_get_lock()``.
+        Call ``await cache.aset(tenant)`` from async contexts to benefit from
+        the lock; ``set()`` is kept synchronous for backwards-compatibility
+        but should only be called before any concurrent tasks access the cache.
+
         Args:
             tenant: The tenant to cache.  Both ID and identifier keys are
                 written atomically.
+        """
+        self._set_unsafe(tenant)
+
+    def _set_unsafe(self, tenant: Tenant) -> None:
+        """Perform the actual insertion without acquiring the lock.
+
+        Called by both ``set()`` (sync, no lock) and ``aset()`` (async, lock
+        already held).
         """
         expires_at = time.monotonic() + self._ttl
 
@@ -177,6 +208,18 @@ class TenantCache:
         self._by_id[tenant.id] = _Entry(tenant=tenant, expires_at=expires_at)
         self._by_id.move_to_end(tenant.id)  # mark as MRU
         self._id_by_ident[tenant.identifier] = tenant.id
+
+    async def aset(self, tenant: Tenant) -> None:
+        """Async variant of ``set()`` — acquires the mutex before writing.
+
+        Use this in async code paths (middleware, resolvers, cache proxies)
+        to guarantee safety under concurrent task scheduling.
+
+        Args:
+            tenant: The tenant to cache.
+        """
+        async with self._get_lock():
+            self._set_unsafe(tenant)
 
     ################
     # Invalidation #

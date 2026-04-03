@@ -56,6 +56,12 @@ class JWTTenantResolver(BaseTenantResolver):
         algorithm: Signing algorithm (default: ``"HS256"``).
         tenant_claim: JWT payload claim holding the tenant identifier
             (default: ``"tenant_id"``).
+        audience: Expected ``aud`` claim value.  When set, PyJWT verifies that
+            the decoded token contains a matching audience claim and raises
+            ``TenantResolutionError`` otherwise.  Strongly recommended when
+            the same JWT secret is shared across multiple services to prevent
+            cross-service token replay attacks.  Default: ``None`` (no audience
+            check — a warning is emitted at resolver construction time).
 
     Raises:
         ImportError: When ``PyJWT`` is not installed.
@@ -66,6 +72,7 @@ class JWTTenantResolver(BaseTenantResolver):
             store,
             secret="my-super-secret-key-at-least-32-chars",
             tenant_claim="tenant_id",
+            audience="my-api-service",
         )
 
         # Request: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp...
@@ -78,6 +85,7 @@ class JWTTenantResolver(BaseTenantResolver):
         secret: str,
         algorithm: str = "HS256",
         tenant_claim: str = "tenant_id",
+        audience: str | None = None,
     ) -> None:
         super().__init__(store)
         try:
@@ -93,6 +101,16 @@ class JWTTenantResolver(BaseTenantResolver):
         self._secret = secret
         self._algorithm = algorithm
         self._tenant_claim = tenant_claim
+        self._audience = audience
+
+        # Warn when no audience is configured so operators are
+        # alerted to the cross-service replay risk during startup.
+        if audience is None:
+            logger.warning(
+                "JWTTenantResolver: no 'audience' configured.  If multiple "
+                "services share the same JWT secret, set audience= to prevent "
+                "cross-service token replay attacks."
+            )
 
     def _decode_token(self, token: str | bytes) -> dict[str, Any]:
         """Verify and decode a JWT string.
@@ -104,18 +122,31 @@ class JWTTenantResolver(BaseTenantResolver):
             Decoded payload dictionary.
 
         Raises:
-            TenantResolutionError: On any JWT verification failure.
+            TenantResolutionError: On any JWT verification failure including
+                audience mismatch (when ``audience`` is configured).
         """
         try:
-            return self._jwt.decode(
-                token,
-                self._secret,
-                algorithms=[self._algorithm],
-            )
+            # Pass audience so PyJWT validates the ``aud`` claim.
+            # When self._audience is None the kwarg is omitted entirely so
+            # behaviour is identical to the pre-fix state for callers
+            # that have not configured an audience yet.
+            decode_kwargs: dict[str, Any] = {
+                "algorithms": [self._algorithm],
+            }
+            if self._audience is not None:
+                decode_kwargs["audience"] = self._audience
+
+            return self._jwt.decode(token, self._secret, **decode_kwargs)
         except self._jwt.ExpiredSignatureError:
             raise TenantResolutionError(
                 reason="JWT token has expired",
                 strategy="jwt",
+            ) from None
+        except self._jwt.InvalidAudienceError:
+            raise TenantResolutionError(
+                reason="JWT audience claim does not match expected audience",
+                strategy="jwt",
+                details={"expected_audience": self._audience},
             ) from None
         except self._jwt.InvalidTokenError as exc:
             raise TenantResolutionError(

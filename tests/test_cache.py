@@ -355,3 +355,96 @@ class TestCacheInvalidationOnWrite:
         cache.set(tenant)
         await proxy.delete(tenant.id)
         assert cache.get(tenant.id) is None
+
+
+class TestCacheLockSafety:
+    """Verify that concurrent aset() calls never cross-wire identifier→id mappings."""
+
+    async def test_aset_populates_both_indices(self) -> None:
+        """aset() writes to both _by_id and _id_by_ident atomically."""
+        c = TenantCache(ttl=60)
+        t = _t("t1", "lock-test")
+        await c.aset(t)
+        assert c.get("t1") is t
+        assert c.get_by_identifier("lock-test") is t
+
+    async def test_concurrent_aset_no_cross_wiring(self) -> None:
+        """Concurrent aset() for distinct tenants must not mix identifier mappings."""
+        import asyncio  # noqa: PLC0415
+
+        c = TenantCache(max_size=100, ttl=60)
+        tenants = [_t(f"t{i}", f"slug-{i:03d}") for i in range(20)]
+
+        # Fire all aset() calls simultaneously so the scheduler interleaves them.
+        await asyncio.gather(*(c.aset(t) for t in tenants))
+
+        # Every identifier must point to exactly the right tenant id.
+        for t in tenants:
+            cached = c.get_by_identifier(t.identifier)
+            assert cached is not None, f"identifier {t.identifier!r} not found"
+            assert cached.id == t.id, (
+                f"identifier {t.identifier!r} maps to {cached.id!r}, expected {t.id!r}"
+            )
+
+    async def test_aset_overwrites_same_id(self) -> None:
+        """aset() replaces an existing entry and updates the identifier index."""
+        c = TenantCache(ttl=60)
+        old = _t("t1", "old-slug")
+        new = _t("t1", "new-slug")
+        await c.aset(old)
+        await c.aset(new)
+        assert c.get_by_identifier("old-slug") is None
+        assert c.get_by_identifier("new-slug") is new
+
+    async def test_lock_created_lazily_inside_event_loop(self) -> None:
+        """_get_lock() must succeed when called from inside a running event loop."""
+        c = TenantCache(ttl=60)
+        assert c._lock is None  # not yet created
+        lock = c._get_lock()
+        assert lock is not None
+        # Second call returns the same instance.
+        assert c._get_lock() is lock
+
+    async def test_caching_proxy_uses_aset_on_miss(self) -> None:
+        """_CachingStoreProxy.get_by_identifier() populates L1 via aset() (lock-safe)."""
+        import asyncio  # noqa: PLC0415
+
+        backing = InMemoryTenantStore()
+        l1 = TenantCache(max_size=100, ttl=60)
+        for i in range(10):
+            await backing.create(_t(f"t{i}", f"concurrent-{i:03d}"))
+
+        proxy = _CachingStoreProxy(backing, l1)
+        # Resolve all tenants concurrently — would race without the lock.
+        results = await asyncio.gather(
+            *(proxy.get_by_identifier(f"concurrent-{i:03d}") for i in range(10))
+        )
+        assert len(results) == 10
+        for i, r in enumerate(results):
+            assert r.identifier == f"concurrent-{i:03d}"
+
+    async def test_caching_proxy_update_invalidates_old_identifier(self) -> None:
+        """FIX: renaming a tenant in update() must evict the OLD identifier."""
+        backing = InMemoryTenantStore()
+        l1 = TenantCache(max_size=100, ttl=60)
+        original = _t("rename-id", "original-slug")
+        await backing.create(original)
+        proxy = _CachingStoreProxy(backing, l1)
+
+        # Warm the cache with the original slug.
+        await proxy.get_by_identifier("original-slug")
+        assert l1.get_by_identifier("original-slug") is not None
+
+        # Manually inject the renamed tenant into the backing store so we can
+        # call proxy.update(renamed) and verify the proxy evicts the OLD slug.
+        renamed = _t("rename-id", "renamed-slug")
+        backing._tenants["rename-id"] = renamed
+        backing._identifier_map["renamed-slug"] = "rename-id"
+        backing._identifier_map.pop("original-slug", None)
+
+        # Calling update() via the proxy should evict the old slug from L1.
+        await proxy.update(renamed)
+
+        assert l1.get_by_identifier("original-slug") is None, (
+            "OLD identifier must be evicted from L1 on rename"
+        )

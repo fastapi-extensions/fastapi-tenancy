@@ -232,6 +232,18 @@ class TenancyConfig(BaseSettings):
         description="Rate-limit sliding window duration in seconds.",
     )
 
+    rate_limit_fail_closed: bool = Field(
+        default=False,
+        description=(
+            "When True, a Redis failure during rate-limit check raises "
+            "RateLimitExceededError (fail-closed / strict). "
+            "When False (default), the check is skipped on Redis error so "
+            "requests are allowed through (fail-open / lenient). "
+            "Set to True in high-security environments where a Redis outage "
+            "must never bypass rate limiting."
+        ),
+    )
+
     ##################################
     # Resolution strategy parameters #
     ##################################

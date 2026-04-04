@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from fastapi_tenancy.core.context import get_current_tenant, get_current_tenant_optional
 from fastapi_tenancy.core.types import Tenant, TenantConfig
@@ -193,16 +193,23 @@ def make_audit_log_dependency(
     from fastapi_tenancy.core.types import AuditLog  # noqa: PLC0415
 
     async def _get_audit_logger(
+        request: Request,
         tenant: Annotated[Tenant, Depends(get_current_tenant)],
     ) -> Any:
         """Return an async function that logs an audit entry for the current tenant.
 
         Args:
+            request: The current HTTP request (used to extract client IP and
+                user-agent for the audit record).
             tenant: Current tenant.
 
         Returns:
             An ``async def log(action, resource, **kwargs)`` callable.
         """
+        # Capture request-level context once so the inner ``log``
+        # closure does not need to re-read request headers on every call.
+        client_ip: str | None = request.client.host if request.client else None
+        user_agent: str | None = request.headers.get("user-agent")
 
         async def log(
             action: str,
@@ -229,6 +236,8 @@ def make_audit_log_dependency(
                 resource=resource,
                 resource_id=resource_id,
                 metadata=metadata or {},
+                ip_address=client_ip,
+                user_agent=user_agent,
                 timestamp=datetime.now(UTC),
             )
             # Delegate to manager's audit log writer if configured.

@@ -951,6 +951,9 @@ class SchemaIsolationProvider(BaseIsolationProvider):
 
     async def close(self) -> None:
         """Dispose the engine and release pooled connections."""
+        # Close the MySQL delegate first (it holds its own engine reference).
+        if self._mysql_delegate is not None:
+            await self._mysql_delegate.close()
         await self.engine.dispose()
         logger.info("SchemaIsolationProvider closed")
 

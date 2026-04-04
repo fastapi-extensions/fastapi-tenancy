@@ -533,3 +533,134 @@ class TestHeaderResolverEnumeration:
         request = _make_request(headers={"X-Tenant-ID": "known-tenant"})
         resolved = await resolver.resolve(request)
         assert resolved.identifier == "known-tenant"
+
+
+class TestJWTAudienceValidation:
+    """FIX: JWTTenantResolver must validate the 'aud' claim when
+    audience= is configured, preventing cross-service token replay."""
+
+    @pytest.fixture
+    async def seeded_store(self) -> InMemoryTenantStore:
+        s = InMemoryTenantStore()
+        await s.create(_make_tenant("aud-tenant"))
+        return s
+
+    def _token(
+        self,
+        identifier: str = "aud-tenant",
+        audience: str | None = None,
+        secret: str = _JWT_SECRET,
+    ) -> str:
+        payload: dict[str, str] = {"tenant_id": identifier}
+        if audience is not None:
+            payload["aud"] = audience
+        return str(pyjwt.encode(payload, secret, algorithm="HS256"))
+
+    async def test_valid_audience_resolves_tenant(self, seeded_store: InMemoryTenantStore) -> None:
+        """Token with matching aud claim must resolve successfully."""
+        resolver = JWTTenantResolver(
+            seeded_store,
+            secret=_JWT_SECRET,
+            audience="my-api",
+        )
+        token = self._token(audience="my-api")
+        request = _make_request(headers={"Authorization": f"Bearer {token}"})
+        tenant = await resolver.resolve(request)
+        assert tenant.identifier == "aud-tenant"
+
+    async def test_wrong_audience_raises_resolution_error(
+        self, seeded_store: InMemoryTenantStore
+    ) -> None:
+        """Token with wrong aud claim must raise TenantResolutionError."""
+        resolver = JWTTenantResolver(
+            seeded_store,
+            secret=_JWT_SECRET,
+            audience="service-a",
+        )
+        # Token claims audience "service-b" — different service.
+        token = self._token(audience="service-b")
+        request = _make_request(headers={"Authorization": f"Bearer {token}"})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert "audience" in exc_info.value.reason.lower()
+        assert exc_info.value.strategy == "jwt"
+
+    async def test_missing_audience_claim_raises_when_audience_configured(
+        self, seeded_store: InMemoryTenantStore
+    ) -> None:
+        """Token without aud claim must be rejected when audience= is set."""
+        resolver = JWTTenantResolver(
+            seeded_store,
+            secret=_JWT_SECRET,
+            audience="expected-audience",
+        )
+        # Token has no aud claim at all.
+        token = self._token(audience=None)
+        request = _make_request(headers={"Authorization": f"Bearer {token}"})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert exc_info.value.strategy == "jwt"
+
+    async def test_no_audience_configured_still_resolves(
+        self, seeded_store: InMemoryTenantStore
+    ) -> None:
+        """When audience=None (default), tokens without aud still resolve."""
+        resolver = JWTTenantResolver(
+            seeded_store,
+            secret=_JWT_SECRET,
+            audience=None,
+        )
+        # Token has no aud claim — should work fine with no audience check.
+        token = self._token(audience=None)
+        request = _make_request(headers={"Authorization": f"Bearer {token}"})
+        tenant = await resolver.resolve(request)
+        assert tenant.identifier == "aud-tenant"
+
+    async def test_audience_mismatch_details_include_expected(
+        self, seeded_store: InMemoryTenantStore
+    ) -> None:
+        """details dict on audience error must contain expected_audience."""
+        resolver = JWTTenantResolver(
+            seeded_store,
+            secret=_JWT_SECRET,
+            audience="correct-service",
+        )
+        token = self._token(audience="wrong-service")
+        request = _make_request(headers={"Authorization": f"Bearer {token}"})
+        with pytest.raises(TenantResolutionError) as exc_info:
+            await resolver.resolve(request)
+        assert exc_info.value.details.get("expected_audience") == "correct-service"
+
+    def test_no_audience_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Constructing JWTTenantResolver without audience= must emit a WARNING."""
+        import logging  # noqa: PLC0415
+
+        store = InMemoryTenantStore()
+        with caplog.at_level(logging.WARNING, logger="fastapi_tenancy.resolution.jwt"):
+            JWTTenantResolver(store, secret=_JWT_SECRET, audience=None)
+
+        assert any("audience" in r.message.lower() for r in caplog.records), (
+            "Expected warning about missing audience configuration"
+        )
+
+    def test_with_audience_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Configuring audience= must suppress the replay-risk warning."""
+        import logging  # noqa: PLC0415
+
+        store = InMemoryTenantStore()
+        with caplog.at_level(logging.WARNING, logger="fastapi_tenancy.resolution.jwt"):
+            JWTTenantResolver(store, secret=_JWT_SECRET, audience="my-service")
+
+        audience_warnings = [r for r in caplog.records if "audience" in r.message.lower()]
+        assert not audience_warnings, "No warning expected when audience is configured"
+
+    def test_audience_stored_on_resolver(self) -> None:
+        """resolver._audience must reflect the constructor argument."""
+        store = InMemoryTenantStore()
+        resolver = JWTTenantResolver(store, secret=_JWT_SECRET, audience="svc-x")
+        assert resolver._audience == "svc-x"
+
+    def test_none_audience_stored(self) -> None:
+        store = InMemoryTenantStore()
+        resolver = JWTTenantResolver(store, secret=_JWT_SECRET, audience=None)
+        assert resolver._audience is None

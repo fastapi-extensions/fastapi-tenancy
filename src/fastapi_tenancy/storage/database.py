@@ -190,7 +190,14 @@ class TenantModel(_Base):
         """
         try:
             meta: dict[str, Any] = json.loads(self.tenant_metadata or "{}")
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            # Corrupt metadata previously silently fell back to {}.
+            # An Exception log is now emitted so corrupt rows surface in alerting
+            # rather than causing silent quota/feature-flag misconfiguration.
+            logger.exception(
+                f"Corrupt tenant_metadata for tenant id={self.id!r} — falling back to empty dict.  "
+                f"Inspect and repair the row in the tenants table.  Error: {exc.__repr__()}",
+            )
             meta = {}
 
         def _ensure_utc(dt: datetime | None) -> datetime:

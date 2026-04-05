@@ -20,7 +20,7 @@ from fastapi_tenancy.core.exceptions import (
 )
 from fastapi_tenancy.core.types import IsolationStrategy, ResolutionStrategy, Tenant, TenantStatus
 from fastapi_tenancy.manager import TenancyManager
-from fastapi_tenancy.middleware.tenancy import TenancyMiddleware, _json_response
+from fastapi_tenancy.middleware.tenancy import TenancyMiddleware, _json_response, _ws_close
 from fastapi_tenancy.storage.memory import InMemoryTenantStore
 
 
@@ -566,3 +566,190 @@ class TestResponseAlreadyStarted:
         await mw(self._raw_scope(), self._fake_receive, noop_send)
         # Context must be cleaned up after the request, regardless of errors
         assert TenantContext.get_optional() is None
+
+
+class TestJsonResponseIsAsyncDef:
+    """_json_response must be a native coroutine function (async def), not a
+    sync function that returns a coroutine object."""
+
+    def test_json_response_is_coroutine_function(self) -> None:
+        import inspect  # noqa: PLC0415
+
+        assert inspect.iscoroutinefunction(_json_response), (
+            "_json_response must be declared as 'async def' so forgetting "
+            "'await' is a type error, not a silent no-op"
+        )
+
+    async def test_json_response_sends_correct_messages(self) -> None:
+        """Calling _json_response with await must emit start + body messages."""
+
+        sent: list[dict[str, Any]] = []
+
+        async def fake_send(msg: dict[str, Any]) -> None:
+            sent.append(msg)
+
+        await _json_response(fake_send, 422, "unprocessable")  # type: ignore[arg-type]
+
+        assert len(sent) == 2
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 422
+        assert sent[1]["type"] == "http.response.body"
+        body = json.loads(sent[1]["body"])
+        assert body == {"detail": "unprocessable"}
+        assert sent[1]["more_body"] is False
+
+    async def test_json_response_with_extra_headers(self) -> None:
+
+        sent: list[dict[str, Any]] = []
+
+        async def fake_send(msg: dict[str, Any]) -> None:
+            sent.append(msg)
+
+        await _json_response(
+            fake_send,  # type: ignore[arg-type]
+            429,
+            "slow down",
+            extra_headers=[(b"retry-after", b"60")],
+        )
+        headers = dict(sent[0]["headers"])
+        assert headers[b"retry-after"] == b"60"
+
+
+class TestWebSocketErrorPaths:
+    """Middleware errors on websocket scopes must emit websocket.close
+    frames, never http.response.start (which violates the ASGI spec)."""
+
+    def _ws_scope(self, path: str = "/ws") -> dict[str, Any]:
+        return {
+            "type": "websocket",
+            "path": path,
+            "query_string": b"",
+            "headers": [(b"host", b"localhost")],
+            "subprotocols": [],
+        }
+
+    def _make_ws_manager(self, tenant: Tenant, active: bool = True) -> TenancyManager:
+
+        status = TenantStatus.ACTIVE if active else TenantStatus.SUSPENDED
+        _tenant(tenant.identifier, status)
+        return _make_fastapi_app  # type: ignore[return-value]
+
+    async def _build_ws_manager(
+        self, identifier: str = "ws-tenant", active: bool = True
+    ) -> TenancyManager:
+        t = _tenant(identifier, TenantStatus.ACTIVE if active else TenantStatus.SUSPENDED)
+        return await _build_manager(t)
+
+    async def test_inactive_tenant_sends_ws_close_not_http(self) -> None:
+        """Suspended tenant on a WebSocket scope must receive websocket.close."""
+
+        t = _tenant("ws-inactive", TenantStatus.SUSPENDED)
+        manager = await _build_manager(t)
+
+        sent: list[dict[str, Any]] = []
+
+        async def fake_send(msg: dict[str, Any]) -> None:
+            sent.append(msg)
+
+        async def fake_receive() -> dict[str, Any]:
+            return {"type": "websocket.connect"}
+
+        async def fake_app(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+            pass  # should never be reached
+
+        mw = TenancyMiddleware(fake_app, manager)
+        scope = self._ws_scope()
+        scope["headers"] = [(b"x-tenant-id", b"ws-inactive")]
+
+        await mw(scope, fake_receive, fake_send)  # type: ignore[arg-type]
+
+        msg_types = [m["type"] for m in sent]
+        assert "http.response.start" not in msg_types, (
+            "Must not send http.response.start on a websocket scope"
+        )
+        assert any(m["type"] == "websocket.close" for m in sent), (
+            "Must send websocket.close when tenant is inactive"
+        )
+
+    async def test_unknown_tenant_on_ws_sends_ws_close(self) -> None:
+        """Missing tenant on WebSocket must receive websocket.close, not HTTP 404."""
+
+        t = _tenant("known-tenant")
+        manager = await _build_manager(t)
+
+        sent: list[dict[str, Any]] = []
+
+        async def fake_send(msg: dict[str, Any]) -> None:
+            sent.append(msg)
+
+        async def fake_receive() -> dict[str, Any]:
+            return {"type": "websocket.connect"}
+
+        async def fake_app(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        mw = TenancyMiddleware(fake_app, manager)
+        scope = self._ws_scope()
+        # Send an identifier that does NOT exist in the store.
+        scope["headers"] = [(b"x-tenant-id", b"no-such-tenant")]
+
+        await mw(scope, fake_receive, fake_send)  # type: ignore[arg-type]
+
+        msg_types = [m["type"] for m in sent]
+        assert "http.response.start" not in msg_types
+        assert any(m["type"] == "websocket.close" for m in sent)
+
+    async def test_ws_close_uses_1008_for_policy_errors(self) -> None:
+        """Policy-violation errors (403, 404) must use WebSocket close code 1008."""
+
+        t = _tenant("ws-suspended", TenantStatus.SUSPENDED)
+        manager = await _build_manager(t)
+
+        sent: list[dict[str, Any]] = []
+
+        async def fake_send(msg: dict[str, Any]) -> None:
+            sent.append(msg)
+
+        async def fake_receive() -> dict[str, Any]:
+            return {"type": "websocket.connect"}
+
+        async def fake_app(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        mw = TenancyMiddleware(fake_app, manager)
+        scope = self._ws_scope()
+        scope["headers"] = [(b"x-tenant-id", b"ws-suspended")]
+
+        await mw(scope, fake_receive, fake_send)  # type: ignore[arg-type]
+
+        close_msgs = [m for m in sent if m["type"] == "websocket.close"]
+        assert close_msgs, "Expected at least one websocket.close message"
+        assert close_msgs[0]["code"] == 1008, (
+            f"Expected close code 1008 (Policy Violation), got {close_msgs[0]['code']}"
+        )
+
+    async def test_http_scope_still_gets_json_response(self) -> None:
+        """HTTP scope errors must still return JSON, not websocket.close."""
+        t = _tenant("http-suspended", TenantStatus.SUSPENDED)
+        manager = await _build_manager(t)
+        app = _make_fastapi_app(manager)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+            headers={"X-Tenant-ID": "http-suspended"},
+        ) as client:
+            resp = await client.get("/")
+
+        assert resp.status_code == 403
+        assert resp.headers["content-type"].startswith("application/json")
+        assert "detail" in resp.json()
+
+    async def test_ws_close_helper_is_best_effort(self) -> None:
+        """_ws_close must not propagate exceptions from a broken send callable."""
+
+        async def broken_send(msg: dict[str, Any]) -> None:
+            raise RuntimeError("transport gone")
+
+        # Must not raise.
+        await _ws_close(broken_send, code=1008)  # type: ignore[arg-type]

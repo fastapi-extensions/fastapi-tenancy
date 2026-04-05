@@ -64,6 +64,7 @@ health checks, metrics endpoints, and static files::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from typing import TYPE_CHECKING, Any
@@ -78,29 +79,24 @@ from fastapi_tenancy.core.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
     from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
 
-def _json_response(
+async def _json_response(
     send: Send,
     status_code: int,
     detail: str,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
-) -> Awaitable[None]:
-    """Build and send a minimal JSON error response.
+) -> None:
+    """Build and send a minimal JSON error response over an HTTP connection.
 
     Args:
         send: ASGI send callable.
         status_code: HTTP status code.
         detail: Human-readable error description for the ``detail`` field.
         extra_headers: Optional additional response headers (e.g. Retry-After).
-
-    Returns:
-        Coroutine that completes after the body is sent.
     """
     body = json.dumps({"detail": detail}).encode("utf-8")
     headers: list[tuple[bytes, bytes]] = [
@@ -110,23 +106,36 @@ def _json_response(
     if extra_headers:
         headers.extend(extra_headers)
 
-    async def _send() -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status_code,
-                "headers": headers,
-            }
-        )
-        await send(
-            {
-                "type": "http.response.body",
-                "body": body,
-                "more_body": False,
-            }
-        )
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": headers,
+        }
+    )
+    await send(
+        {
+            "type": "http.response.body",
+            "body": body,
+            "more_body": False,
+        }
+    )
 
-    return _send()
+
+async def _ws_close(send: Send, code: int = 1008) -> None:
+    """Send a WebSocket close frame.
+
+    WebSocket error handling must not emit ``http.response.start``
+    (only valid for HTTP scopes).  Use ``websocket.close`` instead so the
+    ASGI server does not corrupt the connection.
+
+    Args:
+        send: ASGI send callable from a ``websocket`` scope.
+        code: WebSocket close code.  1008 = Policy Violation (tenant inactive /
+              rate limited); 1011 = Internal Error (unexpected tenancy error).
+    """
+    with contextlib.suppress(Exception):
+        await send({"type": "websocket.close", "code": code})
 
 
 class TenancyMiddleware:
@@ -221,12 +230,22 @@ class TenancyMiddleware:
         """
         from starlette.requests import Request  # noqa: PLC0415
 
-        request = Request(scope, receive)
+        is_http = scope["type"] == "http"
+
+        # Request() asserts scope["type"] == "http", so for WebSocket
+        # connections we must build a WebSocket object instead.  Both expose the
+        # same .headers interface that resolvers rely on.
+        if is_http:
+            request = Request(scope, receive)
+        else:
+            from starlette.websockets import WebSocket  # noqa: PLC0415
+
+            request = WebSocket(scope, receive, send)  # type: ignore[assignment]
 
         ##################################################################
         # Wrap send to track whether response headers have been sent.    #
-        # This prevents a second http.response.start from being emitted  #
-        # after the downstream app has already started streaming.        #
+        # Only relevant for HTTP scopes; WebSocket connections don't     #
+        # send http.response.start so response_started stays False.      #
         ##################################################################
         response_started = False
 
@@ -236,20 +255,33 @@ class TenancyMiddleware:
                 response_started = True
             await send(message)
 
+        async def _send_error(
+            status: int, detail: str, extra: list[tuple[bytes, bytes]] | None = None
+        ) -> None:
+            """Send an error response appropriate for the current scope type."""
+            if is_http:
+                if not response_started:
+                    await _json_response(send, status, detail, extra)
+            else:
+                # WebSocket error — close with a policy-violation code.
+                # 1008 = Policy Violation; 1011 = Internal Error.
+                ws_code = 1011 if status == 500 else 1008
+                await _ws_close(send, ws_code)
+
         # Resolve the tenant using the configured resolver.
         try:
             tenant = await self._manager.resolver.resolve(request)
         except TenantResolutionError as exc:
             logger.debug("Tenant resolution failed: %s", exc)
-            await _json_response(send, 400, exc.reason)
+            await _send_error(400, exc.reason)
             return
         except TenantNotFoundError as exc:
             logger.debug("Tenant not found: %s", exc)
-            await _json_response(send, 404, "Tenant not found")
+            await _send_error(404, "Tenant not found")
             return
         except TenancyError as exc:
             logger.exception("Tenancy error during resolution: %s", exc)  # noqa: TRY401
-            await _json_response(send, 500, "Internal tenancy error")
+            await _send_error(500, "Internal tenancy error")
             return
 
         # Guard: only ACTIVE tenants may proceed.
@@ -257,11 +289,7 @@ class TenancyMiddleware:
             logger.info(
                 "Blocked request for inactive tenant %s (status=%s)", tenant.id, tenant.status
             )
-            await _json_response(
-                send,
-                403,
-                f"Tenant is not active (status: {tenant.status.value})",
-            )
+            await _send_error(403, f"Tenant is not active (status: {tenant.status.value})")
             return
 
         # Check rate limit when enabled.
@@ -271,11 +299,10 @@ class TenancyMiddleware:
             except RateLimitExceededError:
                 logger.info("Rate limit exceeded for tenant %s", tenant.id)
                 window = self._manager.config.rate_limit_window_seconds
-                await _json_response(
-                    send,
+                await _send_error(
                     429,
                     "Rate limit exceeded. Please slow down.",
-                    extra_headers=[(b"retry-after", str(window).encode())],
+                    [(b"retry-after", str(window).encode())],
                 )
                 return
 
@@ -300,40 +327,19 @@ class TenancyMiddleware:
 
             await self._app(scope, receive, _send_wrapper)  # type: ignore[arg-type]
         except RateLimitExceededError:
-            if not response_started:
-                window = self._manager.config.rate_limit_window_seconds
-                await _json_response(
-                    send,
-                    429,
-                    "Rate limit exceeded. Please slow down.",
-                    extra_headers=[(b"retry-after", str(window).encode())],
-                )
-            else:
-                logger.exception(
-                    "RateLimitExceededError raised after response already started "
-                    "for tenant %s — cannot send error response",
-                    tenant.id,
-                )
+            window = self._manager.config.rate_limit_window_seconds
+            logger.info("RateLimitExceededError raised in app for tenant %s", tenant.id)
+            await _send_error(
+                429,
+                "Rate limit exceeded. Please slow down.",
+                [(b"retry-after", str(window).encode())],
+            )
         except TenantInactiveError:
-            if not response_started:
-                await _json_response(send, 403, "Tenant is not active.")
-            else:
-                logger.exception(
-                    "TenantInactiveError raised after response already started "
-                    "for tenant %s — cannot send error response",
-                    tenant.id,
-                )
+            logger.info("TenantInactiveError raised in app for tenant %s", tenant.id)
+            await _send_error(403, "Tenant is not active.")
         except TenancyError as exc:
             logger.exception("Unhandled tenancy error: %s", exc)  # noqa: TRY401
-            if not response_started:
-                await _json_response(send, 500, "Internal tenancy error")
-            else:
-                logger.exception(
-                    "TenancyError raised after response already started "
-                    "for tenant %s — cannot send error response: %s",
-                    tenant.id,
-                    exc,  # noqa: TRY401
-                )
+            await _send_error(500, "Internal tenancy error")
         finally:
             # Always restore — never unconditionally clear.
             # Guard against NameError if set() was never reached.

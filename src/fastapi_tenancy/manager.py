@@ -136,7 +136,7 @@ class _CachingStoreProxy:
             return cached
 
         tenant = await self._store.get_by_identifier(identifier)
-        self._l1.set(tenant)
+        await self._l1.aset(tenant)
         logger.debug("L1 cache miss — populated for identifier=%r", identifier)
         return tenant
 
@@ -146,6 +146,11 @@ class _CachingStoreProxy:
         return result
 
     async def update(self, tenant: Tenant) -> Tenant:
+        # Invalidate the *old* identifier before writing so that a
+        # rename does not leave a stale identifier id mapping in L1.
+        old_cached = self._l1.get(tenant.id)
+        if old_cached is not None and old_cached.identifier != tenant.identifier:
+            self._l1.invalidate_by_identifier(old_cached.identifier)
         result = await self._store.update(tenant)
         self._l1.invalidate(result.id)
         return result
@@ -871,7 +876,21 @@ return count + 1
         except RateLimitExceededError:
             raise
         except Exception as exc:
-            logger.warning("Rate limit check failed for tenant %s: %s", tenant.id, exc)
+            # Redis unavailability previously caused silent fail-open.
+            # Log at Exception level so it surfaces in alerting dashboards, and
+            # honour the fail_closed flag when operators want strict enforcement.
+            logger.exception(
+                f"Rate limit Redis failure for tenant {tenant.id!r} — {exc.__repr__()}. "
+                "Operating in fail-{} mode.".format(
+                    "closed" if getattr(self.config, "rate_limit_fail_closed", False) else "open"
+                )
+            )
+            if getattr(self.config, "rate_limit_fail_closed", False):
+                raise RateLimitExceededError(
+                    tenant_id=tenant.id,
+                    limit=self.config.rate_limit_per_minute,
+                    window_seconds=self.config.rate_limit_window_seconds,
+                ) from exc
 
     #############
     # Audit log #

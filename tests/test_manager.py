@@ -1103,3 +1103,84 @@ class TestManagerUsesConfigFields:
         cfg = _manager_cfg(cache_enabled=False)
         m = TenancyManager(cfg, InMemoryTenantStore())
         assert m._l1_cache is None
+
+
+@pytest.mark.integration
+class TestRateLimitFailClosed:
+    """FIX: Redis failure during rate-limit check must be configurable."""
+
+    def _make_limiter_manager(self, *, fail_closed: bool) -> TenancyManager:
+        cfg = _manager_cfg(
+            enable_rate_limiting=True,
+            redis_url="redis://localhost:6379/0",
+            rate_limit_per_minute=10,
+            rate_limit_window_seconds=60,
+            rate_limit_fail_closed=fail_closed,
+        )
+        store = InMemoryTenantStore()
+        m = TenancyManager(cfg, store)
+        # Inject a broken rate-limiter that always raises.
+        m._rate_limiting_enabled = True
+        m._rate_limiter = MagicMock()
+        m._rate_limiter.eval = AsyncMock(side_effect=ConnectionError("Redis down"))
+        return m
+
+    async def test_fail_open_swallows_redis_error(self) -> None:
+        """When fail_closed=False, a Redis error must NOT raise — request passes through."""
+        m = self._make_limiter_manager(fail_closed=False)
+        tenant = _tenant("open-tenant")
+        # Should complete without raising.
+        await m.check_rate_limit(tenant)
+
+    async def test_fail_closed_raises_on_redis_error(self) -> None:
+        """When fail_closed=True, a Redis error must raise RateLimitExceededError."""
+        m = self._make_limiter_manager(fail_closed=True)
+        tenant = _tenant("closed-tenant")
+        with pytest.raises(RateLimitExceededError) as exc_info:
+            await m.check_rate_limit(tenant)
+        assert exc_info.value.tenant_id == tenant.id
+
+    async def test_fail_open_logs_at_error_level(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Redis failure must be logged at ERROR (not WARNING) in both modes."""
+        import logging  # noqa: PLC0415
+
+        m = self._make_limiter_manager(fail_closed=False)
+        tenant = _tenant("log-tenant")
+        with caplog.at_level(logging.ERROR, logger="fastapi_tenancy.manager"):
+            await m.check_rate_limit(tenant)
+        assert any("Rate limit Redis failure" in r.message for r in caplog.records), (
+            "Expected ERROR-level log about Redis failure"
+        )
+
+    async def test_rate_limit_exceeded_still_raises(self) -> None:
+        """A proper RateLimitExceededError from Lua must still propagate."""
+        cfg = _manager_cfg(
+            enable_rate_limiting=True,
+            redis_url="redis://localhost:6379/0",
+            rate_limit_per_minute=5,
+            rate_limit_window_seconds=60,
+            rate_limit_fail_closed=False,
+        )
+        store = InMemoryTenantStore()
+        m = TenancyManager(cfg, store)
+        m._rate_limiting_enabled = True
+        m._rate_limiter = MagicMock()
+        # Lua script returns count > limit → RateLimitExceededError raised inside check.
+        m._rate_limiter.eval = AsyncMock(return_value=6)  # 6 > limit=5
+
+        tenant = _tenant("ratelimited")
+        with pytest.raises(RateLimitExceededError):
+            await m.check_rate_limit(tenant)
+
+    def test_rate_limit_fail_closed_field_default_is_false(self) -> None:
+        """rate_limit_fail_closed must default to False (fail-open) for backwards compat."""
+        cfg = _manager_cfg()
+        assert cfg.rate_limit_fail_closed is False
+
+    def test_rate_limit_fail_closed_field_accepts_true(self) -> None:
+        cfg = _manager_cfg(
+            enable_rate_limiting=True,
+            redis_url="redis://localhost:6379/0",
+            rate_limit_fail_closed=True,
+        )
+        assert cfg.rate_limit_fail_closed is True

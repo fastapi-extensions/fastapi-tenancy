@@ -7,6 +7,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — Security & reliability fixes
+
+> Eleven targeted fixes addressing concurrency safety, WebSocket error handling,
+> JWT security hardening, connection-pool lifecycle, and observability gaps.
+
+### Added
+
+**`TenancyConfig.rate_limit_fail_closed` (`core/config.py`)**
+
+New boolean field (`default=False`) that controls what happens when Redis is
+unavailable during a rate-limit check:
+
+- `False` *(default, fail-open)* — the check is skipped and the request
+  proceeds. Suitable when service availability matters more than strict
+  rate enforcement during outages.
+- `True` *(fail-closed)* — raises `RateLimitExceededError` → HTTP 429.
+  Suitable for high-security environments where bypassing rate limits
+  during a Redis outage is unacceptable.
+
+Configurable via `TENANCY_RATE_LIMIT_FAIL_CLOSED` environment variable.
+
+**`TenantCache.aset()` — async-safe cache write (`cache/tenant_cache.py`)**
+
+New coroutine method that acquires the internal `asyncio.Lock` before
+writing to the cache. Use `await cache.aset(tenant)` in all async contexts
+(middleware, resolvers, cache proxies) to prevent concurrent tasks from
+interleaving writes and corrupting the `identifier → id` mapping.
+
+The synchronous `set()` method is preserved for backwards compatibility and
+synchronous setup code that runs before any concurrent tasks start.
+
+**`JWTTenantResolver.audience` parameter (`resolution/jwt.py`)**
+
+New optional `audience: str | None` parameter on `JWTTenantResolver`. When
+set, PyJWT validates the `aud` claim in every decoded token. Tokens with a
+missing or mismatched `aud` claim raise `TenantResolutionError` with reason
+`"JWT audience claim does not match expected audience"`.
+
+When `audience=None` (the default), a `WARNING` is emitted at resolver
+construction time to alert operators of the cross-service token replay risk.
+
+**`_ws_close()` middleware helper (`middleware/tenancy.py`)**
+
+New internal coroutine `_ws_close(send, code)` that sends a
+`websocket.close` frame. Used by all error paths in `_handle()` when
+`scope["type"] == "websocket"` to comply with the ASGI specification.
+
+### Fixed
+
+**FIX 1 — `TenantCache` not safe under concurrent async tasks**
+
+The `OrderedDict` backing the cache had no mutual-exclusion guard. Two
+concurrent tasks resolving different tenants on a cache miss could interleave
+their `set()` calls, causing the `identifier → id` mapping to point to the
+wrong tenant — a silent cross-tenant data access bug.
+
+Fix: added a lazily-created `asyncio.Lock` (`_get_lock()`). All writes in
+async contexts now go through `aset()` which holds the lock. `_CachingStoreProxy`
+was updated to call `await l1.aset(tenant)` on cache-miss population.
+
+**FIX 2 — Redis failure during rate-limit check logged at WARNING, silently allowed**
+
+A Redis unavailability error (network partition, restart) was caught and
+logged at `WARNING` level only, silently allowing all requests through without
+any observable signal in alerting systems.
+
+Fix: Redis failures are now logged at `ERROR` level. When
+`rate_limit_fail_closed=True`, a `RateLimitExceededError` is raised instead
+of allowing the request through.
+
+**FIX 3 — WebSocket error paths emitted `http.response.start` (ASGI violation)**
+
+When tenant resolution failed, the tenant was inactive, or the rate limit was
+exceeded on a WebSocket scope, the middleware tried to send an
+`http.response.start` ASGI event. This violates the ASGI specification and
+corrupts the connection at the ASGI server level.
+
+Fix: `_handle()` now detects `scope["type"] == "websocket"` and calls
+`_ws_close(send, code)` instead. Policy errors use code `1008`; internal
+errors use `1011`. The resolver correctly builds a `WebSocket` object (not
+`Request`) for WebSocket scopes, since `starlette.requests.Request` asserts
+`scope["type"] == "http"`.
+
+**FIX 4 — `_CachingStoreProxy.update()` did not evict old identifier on rename**
+
+When a tenant's `identifier` (slug) was changed via `update()`, the proxy
+invalidated the entry by ID but did not evict the old identifier key from the
+L1 cache. The old slug remained warm, and subsequent lookups by the old slug
+would resolve to a stale or wrong entry.
+
+Fix: `update()` now looks up the cached entry before the store write. If the
+identifier has changed, `invalidate_by_identifier(old_identifier)` is called
+before proceeding.
+
+**FIX 5 — JWT audience claim not validated (cross-service token replay)**
+
+`JWTTenantResolver._decode_token()` did not pass `audience` to `jwt.decode()`.
+A JWT issued for any service that shared the same secret was accepted by
+every other service using that secret — a cross-service token replay vector.
+
+Fix: when `audience` is configured on the resolver, it is passed directly to
+`jwt.decode()`. `jwt.InvalidAudienceError` is caught and mapped to
+`TenantResolutionError` with a descriptive reason and `details` dict.
+
+**FIX 6 — `_json_response` was a sync function returning a coroutine object**
+
+The function returned an inner `async def _send()` coroutine. Any caller that
+forgot `await` would silently discard the coroutine without sending any
+response — a hard-to-detect bug.
+
+Fix: `_json_response` is now declared as `async def` and sends both ASGI
+messages directly. Forgetting `await` is now a type error, not a silent no-op.
+
+**FIX 7 — MySQL delegate not closed in `SchemaIsolationProvider.close()`**
+
+`SchemaIsolationProvider.__init__()` creates a `DatabaseIsolationProvider`
+delegate when the dialect is MySQL. The `close()` method disposed the main
+engine but never called `await self._mysql_delegate.close()`, leaking the
+delegate's connection pool on application shutdown.
+
+Fix: `close()` now calls `await self._mysql_delegate.close()` before
+disposing the engine.
+
+**FIX 8 — Corrupt `tenant_metadata` JSON silently fell back to `{}`**
+
+`TenantModel.to_domain()` caught `JSONDecodeError` and returned an empty
+metadata dict without any log output. A corrupt row would silently strip all
+tenant configuration — quotas, feature flags, rate limits — with no trace in
+the application logs.
+
+Fix: the exception handler now logs at `ERROR` level with the tenant ID
+before falling back to `{}`.
+
+**FIX 9 — `ip_address` and `user_agent` always `None` in audit log entries**
+
+The `make_audit_log_dependency` closure created `AuditLog` entries with
+`ip_address=None` and `user_agent=None` because the inner function had no
+access to the HTTP request object.
+
+Fix: the dependency function signature now accepts `request: Request` as a
+FastAPI dependency. `request.client.host` and
+`request.headers.get("user-agent")` are captured once and injected into every
+`AuditLog` entry produced by the returned `log()` callable.
+
 ## [0.4.0] — 2026-04-02
 
 > Concurrency hardening, PostgreSQL schema isolation correctness under multi-transaction

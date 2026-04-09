@@ -68,6 +68,8 @@ TENANCY_ISOLATION_STRATEGY=schema
 | `TENANCY_REDIS_URL` | `str` | — |
 | `TENANCY_CACHE_ENABLED` | `bool` | `false` |
 | `TENANCY_CACHE_TTL` | `int` | `3600` |
+| `TENANCY_L1_CACHE_MAX_SIZE` | `int` | `1000` |
+| `TENANCY_L1_CACHE_TTL_SECONDS` | `int` | `60` |
 
 ## Rate limiting
 
@@ -76,6 +78,7 @@ TENANCY_ISOLATION_STRATEGY=schema
 | `TENANCY_ENABLE_RATE_LIMITING` | `bool` | `false` |
 | `TENANCY_RATE_LIMIT_PER_MINUTE` | `int` | `100` |
 | `TENANCY_RATE_LIMIT_WINDOW_SECONDS` | `int` | `60` |
+| `TENANCY_RATE_LIMIT_FAIL_CLOSED` | `bool` | `false` |
 
 ## Security
 

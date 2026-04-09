@@ -20,16 +20,19 @@ For the corresponding environment variables, see [Environment Variables](env-var
 | `database_max_overflow` | `int` | `40` | `TENANCY_DATABASE_MAX_OVERFLOW` | 0–200 |
 | `database_pool_timeout` | `int` | `30` | `TENANCY_DATABASE_POOL_TIMEOUT` | seconds |
 | `database_pool_recycle` | `int` | `3600` | `TENANCY_DATABASE_POOL_RECYCLE` | seconds; min 60 |
-| `database_pool_pre_ping` | `bool` | `True` | `TENANCY_DATABASE_POOL_PRE_PING` | recommended for production |
+| `database_pool_pre_ping` | `bool` | `True` | `TENANCY_DATABASE_POOL_PRE_PING` | recommended for production; silently omitted for SQLite |
 | `database_echo` | `bool` | `False` | `TENANCY_DATABASE_ECHO` | development only |
 | `database_url_template` | `str\|None` | `None` | `TENANCY_DATABASE_URL_TEMPLATE` | required for DATABASE isolation; must contain `{tenant_id}` or `{database_name}` |
 | `max_cached_engines` | `int` | `100` | `TENANCY_MAX_CACHED_ENGINES` | 10–10000 |
 | `redis_url` | `str\|None` | `None` | `TENANCY_REDIS_URL` | required for cache and rate limiting |
 | `cache_ttl` | `int` | `3600` | `TENANCY_CACHE_TTL` | seconds |
 | `cache_enabled` | `bool` | `False` | `TENANCY_CACHE_ENABLED` | requires redis_url |
+| `l1_cache_max_size` | `int` | `1000` | `TENANCY_L1_CACHE_MAX_SIZE` | 10–100000; in-process LRU cache size |
+| `l1_cache_ttl_seconds` | `int` | `60` | `TENANCY_L1_CACHE_TTL_SECONDS` | min 1; in-process cache entry TTL |
 | `enable_rate_limiting` | `bool` | `False` | `TENANCY_ENABLE_RATE_LIMITING` | requires redis_url |
 | `rate_limit_per_minute` | `int` | `100` | `TENANCY_RATE_LIMIT_PER_MINUTE` | 1–10000 |
 | `rate_limit_window_seconds` | `int` | `60` | `TENANCY_RATE_LIMIT_WINDOW_SECONDS` | min 1 |
+| `rate_limit_fail_closed` | `bool` | `False` | `TENANCY_RATE_LIMIT_FAIL_CLOSED` | `True` = block requests when Redis is down; `False` = allow through (fail-open) |
 | `tenant_header_name` | `str` | `X-Tenant-ID` | `TENANCY_TENANT_HEADER_NAME` | header strategy |
 | `domain_suffix` | `str\|None` | `None` | `TENANCY_DOMAIN_SUFFIX` | required for subdomain |
 | `path_prefix` | `str` | `/tenants` | `TENANCY_PATH_PREFIX` | path strategy |
@@ -51,3 +54,19 @@ For the corresponding environment variables, see [Environment Variables](env-var
 | `standard_isolation_strategy` | `str` | `rls` | `TENANCY_STANDARD_ISOLATION_STRATEGY` | hybrid mode |
 | `schema_prefix` | `str` | `tenant_` | `TENANCY_SCHEMA_PREFIX` | must match `^[a-z][a-z0-9_]*$` |
 | `public_schema` | `str` | `public` | `TENANCY_PUBLIC_SCHEMA` | |
+
+## Cross-field validation rules
+
+The following combinations are validated at construction time and raise `ValidationError` if violated:
+
+| Rule | Fields involved |
+|------|----------------|
+| `cache_enabled=True` requires `redis_url` | `cache_enabled`, `redis_url` |
+| `enable_rate_limiting=True` requires `redis_url` | `enable_rate_limiting`, `redis_url` |
+| `resolution_strategy="jwt"` requires `jwt_secret` | `resolution_strategy`, `jwt_secret` |
+| `jwt_secret` must be ≥ 32 characters | `jwt_secret` |
+| `resolution_strategy="subdomain"` requires `domain_suffix` | `resolution_strategy`, `domain_suffix` |
+| `isolation_strategy="database"` requires `database_url_template` with `{tenant_id}` or `{database_name}` | `isolation_strategy`, `database_url_template` |
+| `isolation_strategy="hybrid"` requires `premium_isolation_strategy != standard_isolation_strategy` | all three |
+| `enable_encryption=True` requires `encryption_key` ≥ 32 chars | `enable_encryption`, `encryption_key` |
+| `schema_prefix` must match `^[a-z][a-z0-9_]*$` | `schema_prefix` |

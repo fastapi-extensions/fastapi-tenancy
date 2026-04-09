@@ -9,7 +9,7 @@ fastapi-tenancy provides structured audit logging via `AuditLog` — an immutabl
 
 ## What gets logged
 
-By default, `TenancyManager.write_audit_log()` logs entries at `WARNING` level to the standard Python logger. Use the `make_audit_log_dependency` factory to record application-level operations from route handlers.
+By default, `TenancyManager.write_audit_log()` logs entries at `INFO` level to the standard Python logger. Use the `make_audit_log_dependency` factory to record application-level operations from route handlers.
 
 ## `AuditLog` structure
 
@@ -21,10 +21,15 @@ class AuditLog(BaseModel):
     resource:    str           # resource type: "order", "user", ...
     resource_id: str | None    # specific resource identifier
     metadata:    dict          # supplementary context (diff, old values, …)
-    ip_address:  str | None    # client IP
-    user_agent:  str | None    # client user-agent
+    ip_address:  str | None    # client IP — populated automatically from request
+    user_agent:  str | None    # client User-Agent — populated automatically
     timestamp:   datetime      # UTC timestamp
 ```
+
+!!! note "ip_address and user_agent are auto-populated"
+    When using `make_audit_log_dependency`, the dependency captures
+    `request.client.host` and the `User-Agent` header automatically.
+    You do not need to pass these values manually to the `log()` callable.
 
 ## Recording audit entries
 
@@ -47,6 +52,7 @@ async def delete_order(
     await session.delete(order)
     await session.commit()
 
+    # ip_address and user_agent are captured from the request automatically
     await audit(
         action="delete",
         resource="order",
@@ -55,6 +61,22 @@ async def delete_order(
         metadata={"description": order.description},
     )
     return {"deleted": True}
+```
+
+The resulting `AuditLog` entry will contain:
+
+```python
+AuditLog(
+    tenant_id="t-acme-corp",
+    user_id="user-from-jwt",
+    action="delete",
+    resource="order",
+    resource_id="ord-123",
+    metadata={"description": "..."},
+    ip_address="203.0.113.42",       # from request.client.host
+    user_agent="Mozilla/5.0 ...",    # from User-Agent header
+    timestamp=datetime(2026, ...),
+)
 ```
 
 ## Persisting to a database

@@ -71,7 +71,7 @@ hide:
   <a href="contributing/" class="ft-card">
     <span class="ft-card-icon">🧪</span>
     <h3>Fully tested</h3>
-    <p>753 tests. 95%+ branch coverage. Unit, integration, and end-to-end test suites targeting Python 3.11–3.13.</p>
+    <p>95%+ branch coverage. Unit, integration, and end-to-end test suites targeting Python 3.11–3.13.</p>
   </a>
 </div>
 
@@ -192,7 +192,7 @@ async def list_orders(session: Annotated[AsyncSession, Depends(get_db)]):
     pip install "fastapi-tenancy[full]"
     ```
 
-    Installs: `asyncpg` · `redis[hiredis]` · `python-jose[cryptography]` · `alembic`
+    Installs: `asyncpg` · `redis[hiredis]` · `PyJWT` · `alembic`
 
 ---
 

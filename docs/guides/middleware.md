@@ -1,6 +1,6 @@
 ---
 title: Middleware
-description: How TenancyMiddleware works — raw ASGI, excluded paths, error mapping.
+description: How TenancyMiddleware works — raw ASGI, excluded paths, WebSocket support, error mapping.
 ---
 
 # Middleware
@@ -51,17 +51,29 @@ excluded_paths=[
 
 ## Error handling
 
-The middleware converts typed exceptions to HTTP JSON responses:
+The middleware maps typed exceptions to scope-appropriate responses:
 
-| Exception | HTTP | JSON body |
-|-----------|------|-----------|
-| `TenantResolutionError` | 400 | `{"detail": "<reason>"}` |
-| `TenantNotFoundError` | 404 | `{"detail": "Tenant not found"}` |
-| `TenantInactiveError` | 403 | `{"detail": "Tenant is not active (status: <status>)"}` |
-| `RateLimitExceededError` | 429 | `{"detail": "Rate limit exceeded ..."}` |
-| Any other `TenancyError` | 500 | `{"detail": "Internal tenancy error"}` |
+### HTTP scopes
 
-All error responses have `Content-Type: application/json`.
+| Exception | HTTP status | JSON body |
+|-----------|-------------|-----------|
+| `TenantResolutionError` | `400` | `{"detail": "<reason>"}` |
+| `TenantNotFoundError` | `404` | `{"detail": "Tenant not found"}` |
+| `TenantInactiveError` | `403` | `{"detail": "Tenant is not active (status: <status>)"}` |
+| `RateLimitExceededError` | `429` | `{"detail": "Rate limit exceeded ..."}` with `Retry-After` header |
+| Any other `TenancyError` | `500` | `{"detail": "Internal tenancy error"}` |
+
+All HTTP error responses have `Content-Type: application/json`.
+
+### WebSocket scopes
+
+For WebSocket connections, HTTP response events (`http.response.start`) are invalid and would corrupt the ASGI connection. The middleware sends `websocket.close` frames instead:
+
+| Condition | WebSocket close code | Meaning |
+|-----------|---------------------|---------|
+| Resolution failure / tenant not found / inactive | `1008` | Policy Violation |
+| Rate limit exceeded | `1008` | Policy Violation |
+| Unexpected internal error | `1011` | Internal Error |
 
 ## Request lifecycle
 
@@ -71,17 +83,19 @@ Client request
     ▼
 TenancyMiddleware.__call__()
     │
-    ├── scope["type"] not "http"/"websocket" → pass through
+    ├── scope["type"] not "http"/"websocket" → pass through unchanged
     │
-    ├── path in excluded_paths → pass through
+    ├── path in excluded_paths → pass through unchanged
     │
     └── _handle()
             │
-            ├── resolver.resolve(request) → Tenant  ──or── error response
+            ├── Build Request (HTTP) or WebSocket (ws) object for resolver
             │
-            ├── tenant.is_active()? No → 403
+            ├── resolver.resolve(request) → Tenant  ──or── _send_error()
             │
-            ├── check_rate_limit(tenant)? Exceeded → 429
+            ├── tenant.is_active()? No → _send_error(403 / ws:1008)
+            │
+            ├── check_rate_limit(tenant)? Exceeded → _send_error(429 / ws:1008)
             │
             ├── TenantContext.set(tenant) → token
             │
@@ -110,12 +124,12 @@ Or directly via `TenantContext` (not recommended in route handlers — prefer `D
 ```python
 from fastapi_tenancy.core.context import TenantContext
 
-tenant = TenantContext.get()  # raises if not set
+tenant = TenantContext.get()  # raises TenantNotFoundError if not set
 ```
 
 ## WebSocket support
 
-The middleware handles both `http` and `websocket` scope types. WebSocket connections are resolved the same way as HTTP requests:
+The middleware resolves the tenant from the WebSocket upgrade request using the same resolver that handles HTTP. Resolution is based on the request headers (or path / JWT, depending on `resolution_strategy`).
 
 ```python
 @app.websocket("/ws/events")
@@ -125,5 +139,13 @@ async def websocket_events(
 ):
     await websocket.accept()
     # tenant is resolved from the upgrade request headers
-    ...
+    while True:
+        data = await websocket.receive_json()
+        await websocket.send_json({"tenant": tenant.identifier, "echo": data})
 ```
+
+If the tenant is not found, inactive, or the rate limit is exceeded during a WebSocket handshake, the middleware closes the connection with an appropriate close code rather than sending an HTTP response.
+
+## `_json_response` internal helper
+
+The `_json_response` function used internally to build HTTP error responses is a proper `async def` coroutine. This makes it safe to call with `await` and ensures any forgotten `await` is caught as a type error rather than silently producing a no-op coroutine object.

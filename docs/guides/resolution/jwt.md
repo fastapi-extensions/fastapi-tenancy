@@ -22,7 +22,7 @@ config = TenancyConfig(
     database_url="...",
     resolution_strategy="jwt",
     jwt_secret="your-secret-key-at-least-32-characters-long",  # required
-    jwt_algorithm="HS256",    # default
+    jwt_algorithm="HS256",         # default
     jwt_tenant_claim="tenant_id",  # default — claim name in the JWT payload
 )
 ```
@@ -55,13 +55,49 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 1. `Authorization` header is read and the `Bearer ` prefix is stripped
 2. The token is decoded and the signature is verified using `jwt_secret`
 3. Token expiry (`exp` claim) is verified automatically
-4. The `jwt_tenant_claim` value (`"acme-corp"`) is extracted
-5. It is validated against tenant slug rules
-6. `store.get_by_identifier("acme-corp")` looks up the tenant
+4. When `audience=` is set, the `aud` claim is verified against the expected value
+5. The `jwt_tenant_claim` value (`"acme-corp"`) is extracted
+6. It is validated against tenant slug rules
+7. `store.get_by_identifier("acme-corp")` looks up the tenant
+
+## Audience validation (recommended)
+
+!!! danger "Cross-service token replay risk"
+    If multiple services share the same JWT secret, a token issued for
+    **Service A** is valid for **Service B** without audience validation.
+    An attacker with a valid token for any service can impersonate any tenant
+    on any other service that shares the secret.
+
+Configure an `audience` on the resolver to prevent cross-service replay attacks:
+
+```python
+# Via JWTTenantResolver directly (custom wiring)
+from fastapi_tenancy.resolution.jwt import JWTTenantResolver
+
+resolver = JWTTenantResolver(
+    store,
+    secret="your-secret-key-at-least-32-chars",
+    audience="my-api-service",   # tokens must carry aud="my-api-service"
+)
+```
+
+When `audience` is configured:
+
+- PyJWT verifies that the decoded token contains an `aud` claim matching the expected value
+- Tokens with a missing, wrong, or absent `aud` claim raise `TenantResolutionError` with reason `"JWT audience claim does not match expected audience"`
+- The `details` dict includes `{"expected_audience": "my-api-service"}` for debugging
+
+When `audience=None` (the default), a **WARNING** is logged at resolver construction time to alert operators of the replay risk:
+
+```
+WARNING  fastapi_tenancy.resolution.jwt: JWTTenantResolver: no 'audience'
+configured. If multiple services share the same JWT secret, set audience= to
+prevent cross-service token replay attacks.
+```
 
 ## Issuing tokens
 
-Your auth service issues JWTs that include the `tenant_id` claim:
+Your auth service issues JWTs that include the `tenant_id` claim (and optionally `aud`):
 
 ```python
 import jwt
@@ -71,6 +107,7 @@ def issue_token(user_id: str, tenant_identifier: str) -> str:
     payload = {
         "sub": user_id,
         "tenant_id": tenant_identifier,   # ← must match the configured claim name
+        "aud": "my-api-service",          # ← match the audience= on the resolver
         "iat": datetime.now(UTC),
         "exp": datetime.now(UTC) + timedelta(hours=8),
     }
@@ -82,22 +119,6 @@ def issue_token(user_id: str, tenant_identifier: str) -> str:
 For production, prefer RS256 with a key pair — the app only holds the **public key**:
 
 ```python
-import jwt
-
-# Generate key pair (do this once, store private key securely)
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-
-private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-public_key = private_key.public_key()
-
-PUBLIC_PEM = public_key.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-).decode()
-```
-
-```python
 # fastapi-tenancy only needs the public key
 config = TenancyConfig(
     database_url="...",
@@ -107,19 +128,23 @@ config = TenancyConfig(
 )
 ```
 
+With RS256 the private key never reaches the API service, so audience validation is still recommended to prevent tokens issued for other services from being accepted.
+
 ## Error responses
 
-| Situation | HTTP status | Cause |
-|-----------|-------------|-------|
-| Missing `Authorization` header | `400` | Header not present |
-| Token not prefixed with `Bearer ` | `400` | Malformed header value |
-| Invalid signature | `400` | Wrong secret or tampered token |
-| Expired token | `400` | `exp` claim is in the past |
-| Missing tenant claim | `400` | `tenant_id` not in payload |
+| Situation | HTTP status | Reason field |
+|-----------|-------------|-------------|
+| Missing `Authorization` header | `400` | `"Authorization header is missing"` |
+| Not prefixed with `Bearer ` | `400` | `"Authorization header does not use Bearer scheme"` |
+| Empty token | `400` | `"Bearer token is empty"` |
+| Invalid signature | `400` | `"JWT token is invalid or signature verification failed"` |
+| Expired token | `400` | `"JWT token has expired"` |
+| Wrong `aud` claim | `400` | `"JWT audience claim does not match expected audience"` |
+| Missing tenant claim | `400` | `"JWT payload is missing claim 'tenant_id'"` |
+| Invalid identifier in claim | `400` | `"JWT claim 'tenant_id' contains an invalid tenant identifier"` |
+| Tenant not found in store | `404` | *(from `TenantNotFoundError`)* |
 
 ## Combining with FastAPI security
-
-You can use fastapi-tenancy JWT resolution alongside FastAPI's built-in security:
 
 ```python
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials

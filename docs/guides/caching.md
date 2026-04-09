@@ -32,8 +32,11 @@ cache = TenantCache(
     ttl=60,         # seconds before an entry is considered stale
 )
 
-# Set
+# Synchronous write (safe before concurrent tasks start)
 cache.set(tenant)
+
+# Async write — acquires the internal asyncio.Lock for task safety
+await cache.aset(tenant)
 
 # Get (returns None on miss or expired entry)
 tenant = cache.get("t-abc123")
@@ -51,34 +54,57 @@ stats = cache.stats()
 #    }
 ```
 
+### Async safety
+
+`TenantCache` protects all write operations with an internal `asyncio.Lock`.
+Use `aset()` — not `set()` — from any async context (middleware, resolvers,
+background tasks) so concurrent tasks cannot interleave their writes and
+corrupt the `identifier → id` mapping.
+
+`set()` remains available for synchronous setup code (e.g. test fixtures,
+module-level initialisation) that runs before any concurrent tasks start.
+
 ### LRU eviction
 
-When the cache reaches `max_size`, the least-recently-used entry is evicted on the next `set()`. This keeps memory usage bounded regardless of tenant count.
+When the cache reaches `max_size`, the least-recently-used entry is evicted on the next `aset()` / `set()`. This keeps memory usage bounded regardless of tenant count.
 
 ### TTL strategy
 
-Entries expire after `ttl` seconds regardless of access pattern. Short TTLs (30–120 s) limit the staleness window after a tenant update. Long TTLs (1–24 h) reduce database load but mean updates take longer to propagate.
+Entries expire after `ttl` seconds regardless of access pattern. Short TTLs (30–120 s) limit the staleness window after a tenant update. Long TTLs reduce database load but mean updates take longer to propagate.
+
+### Configuration via `TenancyConfig`
+
+The in-process cache TTL and max size are first-class config fields:
+
+```python
+config = TenancyConfig(
+    database_url="...",
+    l1_cache_max_size=2000,     # TENANCY_L1_CACHE_MAX_SIZE env var
+    l1_cache_ttl_seconds=120,   # TENANCY_L1_CACHE_TTL_SECONDS env var
+)
+```
+
+`TenancyManager` reads these fields during `initialize()` to configure the
+`TenantCache` instance automatically.
 
 ## Redis write-through cache
 
-For applications with many app instances (multiple workers, Kubernetes pods), the in-process cache is not shared. Use `RedisTenantStore` as a shared cache layer:
+For applications with multiple workers or Kubernetes pods, the in-process cache is not shared across processes. Use `RedisTenantStore` as a shared cache layer:
 
 ```python
 config = TenancyConfig(
     database_url="postgresql+asyncpg://...",
     redis_url="redis://localhost:6379/0",
     cache_enabled=True,
-    cache_ttl=3600,  # seconds
+    cache_ttl=3600,  # seconds — TENANCY_CACHE_TTL env var
 )
 ```
 
-When `cache_enabled=True`, the manager automatically:
-1. Wraps the SQLAlchemy store in a `RedisTenantStore`
-2. Calls `warm_cache()` during `initialize()` to pre-warm with all active tenants
+When `cache_enabled=True`, the manager automatically wraps the SQLAlchemy store in a `RedisTenantStore` and calls `warm_cache()` during `initialize()`.
 
 ## Cache warming
 
-On startup, you can pre-load all active tenants into the cache to eliminate cold-start latency:
+On startup, all active tenants are pre-loaded to eliminate cold-start latency:
 
 ```python
 await manager.initialize()
@@ -90,24 +116,33 @@ Or manually:
 ```python
 tenants = await store.list(status=TenantStatus.ACTIVE)
 for tenant in tenants:
-    cache.set(tenant)
+    await cache.aset(tenant)
 ```
 
 ## Cache invalidation
 
-All write operations (`update`, `set_status`, `update_metadata`, `delete`) automatically invalidate both the `id` and `identifier` cache keys. No manual invalidation is needed in normal operation.
+All write operations (`create`, `update`, `set_status`, `update_metadata`, `delete`) automatically invalidate both the `id` and `identifier` cache keys. No manual invalidation is needed in normal operation.
 
-For cross-process invalidation (multiple app instances without Redis), you have two options:
+!!! note "Identifier rename invalidation"
+    When a tenant's `identifier` (slug) is changed via `update()`, the cache
+    proxy evicts the **old** identifier key before writing the new one. This
+    prevents the old slug from remaining warm and resolving to a stale entry.
 
-1. **Use Redis** — `RedisTenantStore` handles cross-process invalidation automatically
-2. **Short TTL** — Set a short TTL (e.g. 30 s) so stale entries expire quickly
+For cross-process invalidation without Redis, use a short TTL (e.g. 30 s).
+
+## Periodic expired-entry purge
+
+`TenancyManager` runs a background `asyncio.Task` that calls
+`TenantCache.purge_expired()` every `max(1, l1_cache_ttl_seconds // 2)` seconds,
+so expired entries are collected proactively rather than only on access. The
+task is started in `initialize()` and cancelled in `close()`.
 
 ## Tuning
 
 | Scenario | Recommended settings |
 |----------|---------------------|
 | Single-process, low traffic | `cache_enabled=False` (default) |
-| Single-process, high traffic | `TenantCache(max_size=500, ttl=300)` |
+| Single-process, high traffic | `l1_cache_max_size=500`, `l1_cache_ttl_seconds=300` |
 | Multi-process, medium traffic | `cache_enabled=True`, `cache_ttl=300` |
-| Multi-process, high traffic | `cache_enabled=True`, `cache_ttl=60`, `TenantCache(ttl=30)` |
-| Strict consistency required | `cache_enabled=False` or `cache_ttl=0` |
+| Multi-process, high traffic | `cache_enabled=True`, `cache_ttl=60`, `l1_cache_ttl_seconds=30` |
+| Strict consistency required | `cache_enabled=False` or `l1_cache_ttl_seconds=1` |

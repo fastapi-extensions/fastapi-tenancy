@@ -65,17 +65,13 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi_tenancy.dependencies import (
-    get_current_tenant,
-    get_current_tenant_optional,
+    TenantDep,          # pre-built alias for Annotated[Tenant, Depends(get_current_tenant)]
+    TenantOptionalDep,  # pre-built alias for Annotated[Tenant | None, Depends(...optional)]
     make_tenant_db_dependency,
 )
 
-# Define once
-TenantDep         = Annotated[Tenant, Depends(get_current_tenant)]
-TenantOptionalDep = Annotated[Tenant | None, Depends(get_current_tenant_optional)]
-SessionDep        = Annotated[AsyncSession, Depends(make_tenant_db_dependency(manager))]
+SessionDep = Annotated[AsyncSession, Depends(make_tenant_db_dependency(manager))]
 
-# Use everywhere
 @app.get("/orders")
 async def list_orders(
     tenant: TenantDep,
@@ -106,7 +102,7 @@ The metadata fields are validated against `TenantConfig` defaults, so missing ke
 
 ## Audit log
 
-The `make_audit_log_dependency` factory returns a callable that records structured audit entries:
+The `make_audit_log_dependency` factory returns a callable that records structured audit entries. The dependency **automatically captures** the client's IP address and `User-Agent` header from the current request — you do not need to pass them manually.
 
 ```python
 from fastapi_tenancy.dependencies import make_audit_log_dependency
@@ -124,6 +120,7 @@ async def delete_order(
     await session.delete(order)
     await session.commit()
 
+    # ip_address and user_agent are populated from the request automatically
     await audit(
         action="delete",
         resource="order",
@@ -133,6 +130,8 @@ async def delete_order(
     )
     return {"deleted": order_id}
 ```
+
+The resulting `AuditLog` will include `ip_address` and `user_agent` from the HTTP request headers without any extra work from the caller.
 
 ## Combining dependencies
 

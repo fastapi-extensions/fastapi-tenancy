@@ -1449,6 +1449,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#async-safety" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Async safety
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#lru-eviction" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1464,6 +1475,17 @@
     <span class="md-ellipsis">
       
         TTL strategy
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration-via-tenancyconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration via TenancyConfig
       
     </span>
   </a>
@@ -1502,6 +1524,17 @@
     <span class="md-ellipsis">
       
         Cache invalidation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#periodic-expired-entry-purge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Periodic expired-entry purge
       
     </span>
   </a>
@@ -1967,57 +2000,82 @@
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    <span class="n">ttl</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>         <span class="c1"># seconds before an entry is considered stale</span>
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="p">)</span>
 </span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Set</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Synchronous write (safe before concurrent tasks start)</span>
 </span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">cache</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">tenant</span><span class="p">)</span>
 </span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>
-</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1"># Get (returns None on miss or expired entry)</span>
-</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;t-abc123&quot;</span><span class="p">)</span>
-</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">get_by_identifier</span><span class="p">(</span><span class="s2">&quot;acme-corp&quot;</span><span class="p">)</span>
-</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>
-</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="c1"># Invalidate</span>
-</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="n">cache</span><span class="o">.</span><span class="n">invalidate</span><span class="p">(</span><span class="s2">&quot;t-abc123&quot;</span><span class="p">)</span>
-</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="n">cache</span><span class="o">.</span><span class="n">invalidate_by_identifier</span><span class="p">(</span><span class="s2">&quot;acme-corp&quot;</span><span class="p">)</span>
-</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>
-</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="c1"># Stats</span>
-</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="n">stats</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
-</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="c1"># → {</span>
-</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="c1">#      &quot;size&quot;: 42, &quot;max_size&quot;: 1000, &quot;ttl&quot;: 60,</span>
-</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="c1">#      &quot;hits&quot;: 1830, &quot;misses&quot;: 14, &quot;hit_rate_pct&quot;: 99,</span>
-</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="c1">#    }</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1"># Async write — acquires the internal asyncio.Lock for task safety</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="k">await</span> <span class="n">cache</span><span class="o">.</span><span class="n">aset</span><span class="p">(</span><span class="n">tenant</span><span class="p">)</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="c1"># Get (returns None on miss or expired entry)</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;t-abc123&quot;</span><span class="p">)</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">get_by_identifier</span><span class="p">(</span><span class="s2">&quot;acme-corp&quot;</span><span class="p">)</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="c1"># Invalidate</span>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="n">cache</span><span class="o">.</span><span class="n">invalidate</span><span class="p">(</span><span class="s2">&quot;t-abc123&quot;</span><span class="p">)</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="n">cache</span><span class="o">.</span><span class="n">invalidate_by_identifier</span><span class="p">(</span><span class="s2">&quot;acme-corp&quot;</span><span class="p">)</span>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="c1"># Stats</span>
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="n">stats</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="c1"># → {</span>
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="c1">#      &quot;size&quot;: 42, &quot;max_size&quot;: 1000, &quot;ttl&quot;: 60,</span>
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="c1">#      &quot;hits&quot;: 1830, &quot;misses&quot;: 14, &quot;hit_rate_pct&quot;: 99,</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="c1">#    }</span>
 </span></code></pre></div>
+<h3 id="async-safety">Async safety<a class="headerlink" href="#async-safety" title="Anchor link to this section">&para;</a></h3>
+<p><code>TenantCache</code> protects all write operations with an internal <code>asyncio.Lock</code>.
+Use <code>aset()</code> — not <code>set()</code> — from any async context (middleware, resolvers,
+background tasks) so concurrent tasks cannot interleave their writes and
+corrupt the <code>identifier → id</code> mapping.</p>
+<p><code>set()</code> remains available for synchronous setup code (e.g. test fixtures,
+module-level initialisation) that runs before any concurrent tasks start.</p>
 <h3 id="lru-eviction"><abbr title="Least-Recently-Used — eviction policy that removes the item accessed furthest in the past when the cache is full.">LRU</abbr> eviction<a class="headerlink" href="#lru-eviction" title="Anchor link to this section">&para;</a></h3>
-<p>When the cache reaches <code>max_size</code>, the least-recently-used entry is evicted on the next <code>set()</code>. This keeps memory usage bounded regardless of <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> count.</p>
+<p>When the cache reaches <code>max_size</code>, the least-recently-used entry is evicted on the next <code>aset()</code> / <code>set()</code>. This keeps memory usage bounded regardless of <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> count.</p>
 <h3 id="ttl-strategy"><abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr> strategy<a class="headerlink" href="#ttl-strategy" title="Anchor link to this section">&para;</a></h3>
-<p>Entries expire after <code>ttl</code> seconds regardless of access pattern. Short TTLs (30–120 s) limit the staleness window after a <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> update. Long TTLs (1–24 h) reduce database load but mean updates take longer to propagate.</p>
-<h2 id="redis-write-through-cache">Redis write-through cache<a class="headerlink" href="#redis-write-through-cache" title="Anchor link to this section">&para;</a></h2>
-<p>For applications with many app instances (multiple workers, Kubernetes pods), the in-process cache is not shared. Use <code>RedisTenantStore</code> as a shared cache layer:</p>
+<p>Entries expire after <code>ttl</code> seconds regardless of access pattern. Short TTLs (30–120 s) limit the staleness window after a <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> update. Long TTLs reduce database load but mean updates take longer to propagate.</p>
+<h3 id="configuration-via-tenancyconfig">Configuration via <code>TenancyConfig</code><a class="headerlink" href="#configuration-via-tenancyconfig" title="Anchor link to this section">&para;</a></h3>
+<p>The in-process cache <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr> and max size are first-class config fields:</p>
 <div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">TenancyConfig</span><span class="p">(</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">database_url</span><span class="o">=</span><span class="s2">&quot;postgresql+asyncpg://...&quot;</span><span class="p">,</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">redis_url</span><span class="o">=</span><span class="s2">&quot;redis://localhost:6379/0&quot;</span><span class="p">,</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">cache_enabled</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    <span class="n">cache_ttl</span><span class="o">=</span><span class="mi">3600</span><span class="p">,</span>  <span class="c1"># seconds</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="p">)</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">database_url</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">l1_cache_max_size</span><span class="o">=</span><span class="mi">2000</span><span class="p">,</span>     <span class="c1"># TENANCY_L1_CACHE_MAX_SIZE env var</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">l1_cache_ttl_seconds</span><span class="o">=</span><span class="mi">120</span><span class="p">,</span>   <span class="c1"># TENANCY_L1_CACHE_TTL_SECONDS env var</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="p">)</span>
 </span></code></pre></div>
-<p>When <code>cache_enabled=True</code>, the manager automatically:
-1. Wraps the SQLAlchemy store in a <code>RedisTenantStore</code>
-2. Calls <code>warm_cache()</code> during <code>initialize()</code> to pre-warm with all active tenants</p>
+<p><code>TenancyManager</code> reads these fields during <code>initialize()</code> to configure the
+<code>TenantCache</code> instance automatically.</p>
+<h2 id="redis-write-through-cache">Redis write-through cache<a class="headerlink" href="#redis-write-through-cache" title="Anchor link to this section">&para;</a></h2>
+<p>For applications with multiple workers or Kubernetes pods, the in-process cache is not shared across processes. Use <code>RedisTenantStore</code> as a shared cache layer:</p>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">config</span> <span class="o">=</span> <span class="n">TenancyConfig</span><span class="p">(</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="n">database_url</span><span class="o">=</span><span class="s2">&quot;postgresql+asyncpg://...&quot;</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="n">redis_url</span><span class="o">=</span><span class="s2">&quot;redis://localhost:6379/0&quot;</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="n">cache_enabled</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="n">cache_ttl</span><span class="o">=</span><span class="mi">3600</span><span class="p">,</span>  <span class="c1"># seconds — TENANCY_CACHE_TTL env var</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>When <code>cache_enabled=True</code>, the manager automatically wraps the SQLAlchemy store in a <code>RedisTenantStore</code> and calls <code>warm_cache()</code> during <code>initialize()</code>.</p>
 <h2 id="cache-warming">Cache warming<a class="headerlink" href="#cache-warming" title="Anchor link to this section">&para;</a></h2>
-<p>On startup, you can pre-load all active tenants into the cache to eliminate cold-start latency:</p>
-<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">await</span> <span class="n">manager</span><span class="o">.</span><span class="n">initialize</span><span class="p">()</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="c1"># → calls store.warm_cache() when cache_enabled=True</span>
+<p>On startup, all active tenants are pre-loaded to eliminate cold-start latency:</p>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">await</span> <span class="n">manager</span><span class="o">.</span><span class="n">initialize</span><span class="p">()</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="c1"># → calls store.warm_cache() when cache_enabled=True</span>
 </span></code></pre></div>
 <p>Or manually:</p>
-<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">tenants</span> <span class="o">=</span> <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">list</span><span class="p">(</span><span class="n">status</span><span class="o">=</span><span class="n">TenantStatus</span><span class="o">.</span><span class="n">ACTIVE</span><span class="p">)</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">for</span> <span class="n">tenant</span> <span class="ow">in</span> <span class="n">tenants</span><span class="p">:</span>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="n">cache</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">tenant</span><span class="p">)</span>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">tenants</span> <span class="o">=</span> <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">list</span><span class="p">(</span><span class="n">status</span><span class="o">=</span><span class="n">TenantStatus</span><span class="o">.</span><span class="n">ACTIVE</span><span class="p">)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">for</span> <span class="n">tenant</span> <span class="ow">in</span> <span class="n">tenants</span><span class="p">:</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="k">await</span> <span class="n">cache</span><span class="o">.</span><span class="n">aset</span><span class="p">(</span><span class="n">tenant</span><span class="p">)</span>
 </span></code></pre></div>
 <h2 id="cache-invalidation">Cache invalidation<a class="headerlink" href="#cache-invalidation" title="Anchor link to this section">&para;</a></h2>
-<p>All write operations (<code>update</code>, <code>set_status</code>, <code>update_metadata</code>, <code>delete</code>) automatically invalidate both the <code>id</code> and <code>identifier</code> cache keys. No manual invalidation is needed in normal operation.</p>
-<p>For cross-process invalidation (multiple app instances without Redis), you have two options:</p>
-<ol>
-<li><strong>Use Redis</strong> — <code>RedisTenantStore</code> handles cross-process invalidation automatically</li>
-<li><strong>Short <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr></strong> — Set a short <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr> (e.g. 30 s) so stale entries expire quickly</li>
-</ol>
+<p>All write operations (<code>create</code>, <code>update</code>, <code>set_status</code>, <code>update_metadata</code>, <code>delete</code>) automatically invalidate both the <code>id</code> and <code>identifier</code> cache keys. No manual invalidation is needed in normal operation.</p>
+<div class="admonition note">
+<p class="admonition-title">Identifier rename invalidation</p>
+<p>When a <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr>'s <code>identifier</code> (slug) is changed via <code>update()</code>, the cache
+proxy evicts the <strong>old</strong> identifier key before writing the new one. This
+prevents the old slug from remaining warm and resolving to a stale entry.</p>
+</div>
+<p>For cross-process invalidation without Redis, use a short <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr> (e.g. 30 s).</p>
+<h2 id="periodic-expired-entry-purge">Periodic expired-entry purge<a class="headerlink" href="#periodic-expired-entry-purge" title="Anchor link to this section">&para;</a></h2>
+<p><code>TenancyManager</code> runs a background <code>asyncio.Task</code> that calls
+<code>TenantCache.purge_expired()</code> every <code>max(1, l1_cache_ttl_seconds // 2)</code> seconds,
+so expired entries are collected proactively rather than only on access. The
+task is started in <code>initialize()</code> and cancelled in <code>close()</code>.</p>
 <h2 id="tuning">Tuning<a class="headerlink" href="#tuning" title="Anchor link to this section">&para;</a></h2>
 <table>
 <thead>
@@ -2033,7 +2091,7 @@
 </tr>
 <tr>
 <td>Single-process, high traffic</td>
-<td><code>TenantCache(max_size=500, ttl=300)</code></td>
+<td><code>l1_cache_max_size=500</code>, <code>l1_cache_ttl_seconds=300</code></td>
 </tr>
 <tr>
 <td>Multi-process, medium traffic</td>
@@ -2041,11 +2099,11 @@
 </tr>
 <tr>
 <td>Multi-process, high traffic</td>
-<td><code>cache_enabled=True</code>, <code>cache_ttl=60</code>, <code>TenantCache(ttl=30)</code></td>
+<td><code>cache_enabled=True</code>, <code>cache_ttl=60</code>, <code>l1_cache_ttl_seconds=30</code></td>
 </tr>
 <tr>
 <td>Strict consistency required</td>
-<td><code>cache_enabled=False</code> or <code>cache_ttl=0</code></td>
+<td><code>cache_enabled=False</code> or <code>l1_cache_ttl_seconds=1</code></td>
 </tr>
 </tbody>
 </table>

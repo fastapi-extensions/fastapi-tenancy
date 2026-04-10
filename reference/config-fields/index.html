@@ -851,6 +851,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#cross-field-validation-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-field validation rules
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1194,7 +1205,7 @@
 <td><code>bool</code></td>
 <td><code>True</code></td>
 <td><code>TENANCY_DATABASE_POOL_PRE_PING</code></td>
-<td>recommended for production</td>
+<td>recommended for production; silently omitted for SQLite</td>
 </tr>
 <tr>
 <td><code>database_echo</code></td>
@@ -1239,6 +1250,20 @@
 <td>requires redis_url</td>
 </tr>
 <tr>
+<td><code>l1_cache_max_size</code></td>
+<td><code>int</code></td>
+<td><code>1000</code></td>
+<td><code>TENANCY_L1_CACHE_MAX_SIZE</code></td>
+<td>10–100000; in-process <abbr title="Least-Recently-Used — eviction policy that removes the item accessed furthest in the past when the cache is full.">LRU</abbr> cache size</td>
+</tr>
+<tr>
+<td><code>l1_cache_ttl_seconds</code></td>
+<td><code>int</code></td>
+<td><code>60</code></td>
+<td><code>TENANCY_L1_CACHE_TTL_SECONDS</code></td>
+<td>min 1; in-process cache entry <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr></td>
+</tr>
+<tr>
 <td><code>enable_rate_limiting</code></td>
 <td><code>bool</code></td>
 <td><code>False</code></td>
@@ -1258,6 +1283,13 @@
 <td><code>60</code></td>
 <td><code>TENANCY_RATE_LIMIT_WINDOW_SECONDS</code></td>
 <td>min 1</td>
+</tr>
+<tr>
+<td><code>rate_limit_fail_closed</code></td>
+<td><code>bool</code></td>
+<td><code>False</code></td>
+<td><code>TENANCY_RATE_LIMIT_FAIL_CLOSED</code></td>
+<td><code>True</code> = block requests when Redis is down; <code>False</code> = allow through (fail-open)</td>
 </tr>
 <tr>
 <td><code>tenant_header_name</code></td>
@@ -1405,6 +1437,54 @@
 <td><code>public</code></td>
 <td><code>TENANCY_PUBLIC_SCHEMA</code></td>
 <td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="cross-field-validation-rules">Cross-field validation rules<a class="headerlink" href="#cross-field-validation-rules" title="Anchor link to this section">&para;</a></h2>
+<p>The following combinations are validated at construction time and raise <code>ValidationError</code> if violated:</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Fields involved</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cache_enabled=True</code> requires <code>redis_url</code></td>
+<td><code>cache_enabled</code>, <code>redis_url</code></td>
+</tr>
+<tr>
+<td><code>enable_rate_limiting=True</code> requires <code>redis_url</code></td>
+<td><code>enable_rate_limiting</code>, <code>redis_url</code></td>
+</tr>
+<tr>
+<td><code>resolution_strategy="jwt"</code> requires <code>jwt_secret</code></td>
+<td><code>resolution_strategy</code>, <code>jwt_secret</code></td>
+</tr>
+<tr>
+<td><code>jwt_secret</code> must be ≥ 32 characters</td>
+<td><code>jwt_secret</code></td>
+</tr>
+<tr>
+<td><code>resolution_strategy="subdomain"</code> requires <code>domain_suffix</code></td>
+<td><code>resolution_strategy</code>, <code>domain_suffix</code></td>
+</tr>
+<tr>
+<td><code>isolation_strategy="database"</code> requires <code>database_url_template</code> with <code>{tenant_id}</code> or <code>{database_name}</code></td>
+<td><code>isolation_strategy</code>, <code>database_url_template</code></td>
+</tr>
+<tr>
+<td><code>isolation_strategy="hybrid"</code> requires <code>premium_isolation_strategy != standard_isolation_strategy</code></td>
+<td>all three</td>
+</tr>
+<tr>
+<td><code>enable_encryption=True</code> requires <code>encryption_key</code> ≥ 32 chars</td>
+<td><code>enable_encryption</code>, <code>encryption_key</code></td>
+</tr>
+<tr>
+<td><code>schema_prefix</code> must match <code>^[a-z][a-z0-9_]*$</code></td>
+<td><code>schema_prefix</code></td>
 </tr>
 </tbody>
 </table>

@@ -1509,6 +1509,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#websocket-connections" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        WebSocket connections
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-modes-fail-open-vs-fail-closed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure modes — fail-open vs fail-closed
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#per-tenant-limits" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1520,10 +1542,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#bypassing-rate-limits" class="md-nav__link">
+  <a href="#bypassing-rate-limits-for-specific-paths" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Bypassing rate limits
+        Bypassing rate limits for specific paths
       
     </span>
   </a>
@@ -1940,7 +1962,7 @@
 
 
 <h1 id="rate-limiting">Rate Limiting<a class="headerlink" href="#rate-limiting" title="Anchor link to this section">&para;</a></h1>
-<p>fastapi-tenancy provides per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> sliding-window rate limiting backed by Redis sorted sets. When a <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> exceeds its limit, the middleware returns <code>HTTP 429 Too Many Requests</code>.</p>
+<p>fastapi-tenancy provides per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> sliding-window rate limiting backed by Redis sorted sets. When a <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> exceeds its limit, the middleware returns <code>HTTP 429 Too Many Requests</code>. WebSocket connections receive a <code>1008 Policy Violation</code> close frame.</p>
 <h2 id="requirements">Requirements<a class="headerlink" href="#requirements" title="Anchor link to this section">&para;</a></h2>
 <div class="language-bash highlight"><span class="filename">Bash</span><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;fastapi-tenancy[redis]&quot;</span>
 </span></code></pre></div>
@@ -1950,22 +1972,30 @@
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="n">redis_url</span><span class="o">=</span><span class="s2">&quot;redis://localhost:6379/0&quot;</span><span class="p">,</span>   <span class="c1"># required</span>
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    <span class="n">enable_rate_limiting</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    <span class="n">rate_limit_per_minute</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>             <span class="c1"># default — requests per window</span>
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="n">rate_limit_window_seconds</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>          <span class="c1"># default — window duration</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="p">)</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="n">rate_limit_window_seconds</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>          <span class="c1"># default — window duration in seconds</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    <span class="n">rate_limit_fail_closed</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>          <span class="c1"># default — see Failure modes below</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="p">)</span>
 </span></code></pre></div>
-<p>Both <code>redis_url</code> and <code>enable_rate_limiting=True</code> are required together — the config validator will raise <code>ValidationError</code> if <code>enable_rate_limiting=True</code> without a <code>redis_url</code>.</p>
+<p>Both <code>redis_url</code> and <code>enable_rate_limiting=True</code> are required together — the config validator raises <code>ValidationError</code> if <code>enable_rate_limiting=True</code> without a <code>redis_url</code>.</p>
 <h2 id="sliding-window-algorithm">Sliding-window algorithm<a class="headerlink" href="#sliding-window-algorithm" title="Anchor link to this section">&para;</a></h2>
-<p>The rate limiter uses a Redis sorted set per <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr>. Each request adds the current timestamp as a score. To check the limit:</p>
+<p>The rate limiter uses a single Redis sorted set per <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> and a server-side <strong>Lua script</strong> that executes atomically — no TOCTOU race conditions. Each request is represented by a unique member string (<code>"{timestamp}:{uuid4}"</code>) so two concurrent requests arriving within the same microsecond each produce a distinct sorted-set entry rather than overwriting each other.</p>
+<p>Script steps:</p>
 <ol>
-<li><strong>Remove</strong> all scores older than <code>now - window_seconds</code> (<code>ZREMRANGEBYSCORE</code>)</li>
-<li><strong>Count</strong> remaining scores (<code>ZCARD</code>)</li>
-<li>If count ≥ limit → raise <code>RateLimitExceededError</code> → HTTP 429</li>
-<li><strong>Add</strong> current timestamp (<code>ZADD</code>)</li>
-<li><strong>Expire</strong> the key after <code>window_seconds</code> (<code>EXPIRE</code>)</li>
+<li><strong>Remove</strong> all members with scores older than <code>now - window_seconds</code> (<code>ZREMRANGEBYSCORE</code>)</li>
+<li><strong>Count</strong> remaining members (<code>ZCARD</code>)</li>
+<li>If count ≥ limit → <strong>deny</strong> immediately without adding (<code>return count</code>)</li>
+<li>Otherwise <strong>add</strong> this request (<code>ZADD</code>) and refresh the key <abbr title="Time-To-Live — the number of seconds before a cache entry is considered stale and must be refreshed.">TTL</abbr> (<code>EXPIRE</code>)</li>
+<li><strong>Return</strong> the new count (≤ limit = allowed)</li>
 </ol>
-<p>Steps 1–2 run in a single pipeline for atomicity.</p>
 <div class="language-text highlight"><span class="filename">Text Only</span><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Redis key: tenancy:ratelimit:&lt;tenant_id&gt;
 </span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Atomicity</p>
+<p>The entire check-and-increment runs inside a single Lua script evaluated by
+Redis. This replaces the earlier two-pipeline approach that had an off-by-one
+race where concurrent requests could all read <code>count = limit - 1</code>, all pass,
+and then all add — silently breaching the limit.</p>
+</div>
 <h2 id="http-429-response">HTTP 429 response<a class="headerlink" href="#http-429-response" title="Anchor link to this section">&para;</a></h2>
 <div class="language-http highlight"><span class="filename">HTTP</span><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span> <span class="m">429</span> <span class="ne">Too Many Requests</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="na">Content-Type</span><span class="o">:</span> <span class="l">application/json</span>
@@ -1973,51 +2003,83 @@
 </span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
 </span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="p">{</span><span class="nt">&quot;detail&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Rate limit exceeded. Please slow down.&quot;</span><span class="p">}</span>
 </span></code></pre></div>
+<h2 id="websocket-connections">WebSocket connections<a class="headerlink" href="#websocket-connections" title="Anchor link to this section">&para;</a></h2>
+<p>For WebSocket upgrade requests that exceed the rate limit, the middleware sends a <code>websocket.close</code> frame with code <code>1008</code> (Policy Violation) instead of an HTTP response — emitting <code>http.response.start</code> on a WebSocket scope violates the ASGI specification.</p>
+<h2 id="failure-modes-fail-open-vs-fail-closed">Failure modes — fail-open vs fail-closed<a class="headerlink" href="#failure-modes-fail-open-vs-fail-closed" title="Anchor link to this section">&para;</a></h2>
+<p>When Redis is temporarily unavailable (network partition, restart), the rate-limit check raises an exception. The <code>rate_limit_fail_closed</code> field controls what happens next:</p>
+<table>
+<thead>
+<tr>
+<th><code>rate_limit_fail_closed</code></th>
+<th>Redis down</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>False</code> <em>(default)</em></td>
+<td>Logs <code>ERROR</code>, request proceeds</td>
+<td><strong>Fail-open</strong> — service stays up, rate limiting disabled until Redis recovers</td>
+</tr>
+<tr>
+<td><code>True</code></td>
+<td>Raises <code>RateLimitExceededError</code> → <code>HTTP 429</code></td>
+<td><strong>Fail-closed</strong> — strict enforcement, requests blocked during Redis outage</td>
+</tr>
+</tbody>
+</table>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Strict enforcement — block all requests when Redis is down</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">config</span> <span class="o">=</span> <span class="n">TenancyConfig</span><span class="p">(</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="o">...</span><span class="p">,</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="n">enable_rate_limiting</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="n">redis_url</span><span class="o">=</span><span class="s2">&quot;redis://localhost:6379/0&quot;</span><span class="p">,</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="n">rate_limit_fail_closed</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Redis failures are always logged at ERROR level</p>
+<p>Regardless of <code>rate_limit_fail_closed</code>, every Redis failure during a
+rate-limit check is logged at <code>ERROR</code> level so it surfaces in your
+alerting dashboard.</p>
+</div>
+<p>Choose <code>fail_closed=True</code> in high-security environments where bypassing rate
+limits during an outage is unacceptable. Use the default <code>fail_closed=False</code>
+when service availability must be maintained even if Redis is down.</p>
 <h2 id="per-tenant-limits">Per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> limits<a class="headerlink" href="#per-tenant-limits" title="Anchor link to this section">&para;</a></h2>
 <p>The default limit applies to all tenants. To set per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> limits, store the limit in <code>tenant.metadata</code>:</p>
-<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Store per-tenant limit in metadata</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">tenant</span> <span class="o">=</span> <span class="k">await</span> <span class="n">manager</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">update_metadata</span><span class="p">(</span><span class="s2">&quot;t-vip&quot;</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;rate_limit_per_minute&quot;</span><span class="p">:</span> <span class="mi">1000</span><span class="p">})</span>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">await</span> <span class="n">manager</span><span class="o">.</span><span class="n">store</span><span class="o">.</span><span class="n">update_metadata</span><span class="p">(</span><span class="s2">&quot;t-vip&quot;</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;rate_limit_per_minute&quot;</span><span class="p">:</span> <span class="mi">1000</span><span class="p">})</span>
 </span></code></pre></div>
-<p>Read the per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> value from <code>TenantConfig</code> in a custom route dependency and call <code>check_rate_limit</code> after adjusting <code>manager.config.rate_limit_per_minute</code>, or implement a custom pre-request hook using <code>TenantConfig</code>:</p>
-<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">fastapi_tenancy.dependencies</span><span class="w"> </span><span class="kn">import</span> <span class="n">make_tenant_config_dependency</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">fastapi_tenancy.core.types</span><span class="w"> </span><span class="kn">import</span> <span class="n">TenantConfig</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">get_config</span> <span class="o">=</span> <span class="n">make_tenant_config_dependency</span><span class="p">(</span><span class="n">manager</span><span class="p">)</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="c1"># Example: enforce per-tenant limit stored in metadata</span>
-</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">check_per_tenant_limit</span><span class="p">(</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="n">tenant</span><span class="p">:</span> <span class="n">TenantDep</span><span class="p">,</span>
-</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="n">config</span><span class="p">:</span> <span class="n">Annotated</span><span class="p">[</span><span class="n">TenantConfig</span><span class="p">,</span> <span class="n">Depends</span><span class="p">(</span><span class="n">get_config</span><span class="p">)],</span>
-</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="k">if</span> <span class="n">manager</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enable_rate_limiting</span><span class="p">:</span>
-</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>        <span class="c1"># config.rate_limit_per_minute is read from tenant.metadata</span>
-</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>        <span class="n">limit</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">rate_limit_per_minute</span>
-</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>        <span class="c1"># Enforce via your own Redis logic or by calling manager.check_rate_limit(tenant)</span>
-</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>        <span class="c1"># after temporarily setting the global limit — or subclass TenancyManager</span>
-</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>        <span class="c1"># and override check_rate_limit() to read from tenant metadata directly.</span>
-</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>        <span class="k">await</span> <span class="n">manager</span><span class="o">.</span><span class="n">check_rate_limit</span><span class="p">(</span><span class="n">tenant</span><span class="p">)</span>
+<p>Read the per-<abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> value from <code>TenantConfig</code> in a custom dependency:</p>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">fastapi_tenancy.dependencies</span><span class="w"> </span><span class="kn">import</span> <span class="n">make_tenant_config_dependency</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">get_config</span> <span class="o">=</span> <span class="n">make_tenant_config_dependency</span><span class="p">(</span><span class="n">manager</span><span class="p">)</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">check_per_tenant_limit</span><span class="p">(</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="n">tenant</span><span class="p">:</span> <span class="n">TenantDep</span><span class="p">,</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="n">config</span><span class="p">:</span> <span class="n">Annotated</span><span class="p">[</span><span class="n">TenantConfig</span><span class="p">,</span> <span class="n">Depends</span><span class="p">(</span><span class="n">get_config</span><span class="p">)],</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="c1"># config.rate_limit_per_minute reads from tenant.metadata</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="c1"># Subclass TenancyManager and override check_rate_limit() to enforce</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>    <span class="c1"># the per-tenant value instead of the global config setting.</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>    <span class="o">...</span>
 </span></code></pre></div>
-<h2 id="bypassing-rate-limits">Bypassing rate limits<a class="headerlink" href="#bypassing-rate-limits" title="Anchor link to this section">&para;</a></h2>
-<p>Add specific paths to <code>excluded_paths</code> in the middleware, or check the <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> programmatically:</p>
-<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nd">@app</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;/admin/batch-job&quot;</span><span class="p">)</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">batch_job</span><span class="p">(</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="n">tenant</span><span class="p">:</span> <span class="n">TenantDep</span><span class="p">,</span>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">session</span><span class="p">:</span> <span class="n">SessionDep</span><span class="p">,</span>
-</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="p">):</span>
-</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="c1"># This route is excluded from rate limiting because it&#39;s in excluded_paths</span>
-</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="c1"># OR because it runs as an admin without going through the middleware</span>
-</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="o">...</span>
+<h2 id="bypassing-rate-limits-for-specific-paths">Bypassing rate limits for specific paths<a class="headerlink" href="#bypassing-rate-limits-for-specific-paths" title="Anchor link to this section">&para;</a></h2>
+<p>Add paths to <code>excluded_paths</code> in the middleware:</p>
+<div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">app</span><span class="o">.</span><span class="n">add_middleware</span><span class="p">(</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>    <span class="n">TenancyMiddleware</span><span class="p">,</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="n">manager</span><span class="o">=</span><span class="n">manager</span><span class="p">,</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>    <span class="n">excluded_paths</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;/health&quot;</span><span class="p">,</span> <span class="s2">&quot;/metrics&quot;</span><span class="p">,</span> <span class="s2">&quot;/batch&quot;</span><span class="p">],</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="p">)</span>
 </span></code></pre></div>
 <h2 id="monitoring">Monitoring<a class="headerlink" href="#monitoring" title="Anchor link to this section">&para;</a></h2>
-<p>Use Redis to inspect the current rate-limit state:</p>
-<div class="language-bash highlight"><span class="filename">Bash</span><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1"># Count requests for a tenant in the current window</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>ZCARD<span class="w"> </span>tenancy:ratelimit:t-abc123
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="c1"># See all request timestamps (Unix)</span>
-</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>ZRANGE<span class="w"> </span>tenancy:ratelimit:t-abc123<span class="w"> </span><span class="m">0</span><span class="w"> </span>-1<span class="w"> </span>WITHSCORES
-</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>
-</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="c1"># TTL remaining on the key</span>
-</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>TTL<span class="w"> </span>tenancy:ratelimit:t-abc123
+<div class="language-bash highlight"><span class="filename">Bash</span><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Count requests for a tenant in the current window</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>ZCARD<span class="w"> </span>tenancy:ratelimit:t-abc123
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="c1"># See all request timestamps and unique member strings</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>ZRANGE<span class="w"> </span>tenancy:ratelimit:t-abc123<span class="w"> </span><span class="m">0</span><span class="w"> </span>-1<span class="w"> </span>WITHSCORES
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="c1"># TTL remaining on the key</span>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>TTL<span class="w"> </span>tenancy:ratelimit:t-abc123
 </span></code></pre></div>
 <!-- Glossary abbreviations — auto-appended to every page via pymdownx.snippets -->
 <!-- The full glossary page is rendered at reference/glossary-page.md          -->

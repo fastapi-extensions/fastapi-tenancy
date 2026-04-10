@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="How TenancyMiddleware works — raw ASGI, excluded paths, error mapping.">
+        <meta name="description" content="How TenancyMiddleware works — raw ASGI, excluded paths, WebSocket support, error mapping.">
       
       
       
@@ -1366,6 +1366,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Error handling">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#http-scopes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HTTP scopes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#websocket-scopes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        WebSocket scopes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1395,6 +1423,17 @@
     <span class="md-ellipsis">
       
         WebSocket support
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_json_response-internal-helper" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        _json_response internal helper
       
     </span>
   </a>
@@ -1976,69 +2015,100 @@
 </span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="p">]</span>
 </span></code></pre></div>
 <h2 id="error-handling">Error handling<a class="headerlink" href="#error-handling" title="Anchor link to this section">&para;</a></h2>
-<p>The middleware converts typed exceptions to HTTP JSON responses:</p>
+<p>The middleware maps typed exceptions to scope-appropriate responses:</p>
+<h3 id="http-scopes">HTTP scopes<a class="headerlink" href="#http-scopes" title="Anchor link to this section">&para;</a></h3>
 <table>
 <thead>
 <tr>
 <th>Exception</th>
-<th>HTTP</th>
+<th>HTTP status</th>
 <th>JSON body</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>TenantResolutionError</code></td>
-<td>400</td>
+<td><code>400</code></td>
 <td><code>{"detail": "&lt;reason&gt;"}</code></td>
 </tr>
 <tr>
 <td><code>TenantNotFoundError</code></td>
-<td>404</td>
+<td><code>404</code></td>
 <td><code>{"detail": "Tenant not found"}</code></td>
 </tr>
 <tr>
 <td><code>TenantInactiveError</code></td>
-<td>403</td>
+<td><code>403</code></td>
 <td><code>{"detail": "Tenant is not active (status: &lt;status&gt;)"}</code></td>
 </tr>
 <tr>
 <td><code>RateLimitExceededError</code></td>
-<td>429</td>
-<td><code>{"detail": "Rate limit exceeded ..."}</code></td>
+<td><code>429</code></td>
+<td><code>{"detail": "Rate limit exceeded ..."}</code> with <code>Retry-After</code> header</td>
 </tr>
 <tr>
 <td>Any other <code>TenancyError</code></td>
-<td>500</td>
+<td><code>500</code></td>
 <td><code>{"detail": "Internal tenancy error"}</code></td>
 </tr>
 </tbody>
 </table>
-<p>All error responses have <code>Content-Type: application/json</code>.</p>
+<p>All HTTP error responses have <code>Content-Type: application/json</code>.</p>
+<h3 id="websocket-scopes">WebSocket scopes<a class="headerlink" href="#websocket-scopes" title="Anchor link to this section">&para;</a></h3>
+<p>For WebSocket connections, HTTP response events (<code>http.response.start</code>) are invalid and would corrupt the ASGI connection. The middleware sends <code>websocket.close</code> frames instead:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>WebSocket close code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resolution failure / <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> not found / inactive</td>
+<td><code>1008</code></td>
+<td>Policy Violation</td>
+</tr>
+<tr>
+<td>Rate limit exceeded</td>
+<td><code>1008</code></td>
+<td>Policy Violation</td>
+</tr>
+<tr>
+<td>Unexpected internal error</td>
+<td><code>1011</code></td>
+<td>Internal Error</td>
+</tr>
+</tbody>
+</table>
 <h2 id="request-lifecycle">Request lifecycle<a class="headerlink" href="#request-lifecycle" title="Anchor link to this section">&para;</a></h2>
 <div class="language-text highlight"><span class="filename">Text Only</span><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Client request
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    │
 </span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    ▼
 </span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>TenancyMiddleware.__call__()
 </span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    │
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    ├── scope[&quot;type&quot;] not &quot;http&quot;/&quot;websocket&quot; → pass through
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    ├── scope[&quot;type&quot;] not &quot;http&quot;/&quot;websocket&quot; → pass through unchanged
 </span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    │
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    ├── path in excluded_paths → pass through
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    ├── path in excluded_paths → pass through unchanged
 </span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    │
 </span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    └── _handle()
 </span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>            │
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>            ├── resolver.resolve(request) → Tenant  ──or── error response
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>            ├── Build Request (HTTP) or WebSocket (ws) object for resolver
 </span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>            │
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>            ├── tenant.is_active()? No → 403
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>            ├── resolver.resolve(request) → Tenant  ──or── _send_error()
 </span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>            │
-</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>            ├── check_rate_limit(tenant)? Exceeded → 429
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>            ├── tenant.is_active()? No → _send_error(403 / ws:1008)
 </span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>            │
-</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>            ├── TenantContext.set(tenant) → token
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>            ├── check_rate_limit(tenant)? Exceeded → _send_error(429 / ws:1008)
 </span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>            │
-</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>            ├── scope[&quot;state&quot;][&quot;tenant&quot;] = tenant
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>            ├── TenantContext.set(tenant) → token
 </span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>            │
-</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>            ├── await app(scope, receive, send)  ← your routes run here
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>            ├── scope[&quot;state&quot;][&quot;tenant&quot;] = tenant
 </span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>            │
-</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>            └── finally: TenantContext.reset(token)  ← always restored
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>            ├── await app(scope, receive, send)  ← your routes run here
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>            │
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a>            └── finally: TenantContext.reset(token)  ← always restored
 </span></code></pre></div>
 <h2 id="accessing-the-tenant-in-route-handlers">Accessing the <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> in route handlers<a class="headerlink" href="#accessing-the-tenant-in-route-handlers" title="Anchor link to this section">&para;</a></h2>
 <p>The middleware sets the <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> in <code>TenantContext</code> before calling your route handler. Access it via the <code>get_current_tenant</code> dependency:</p>
@@ -2052,10 +2122,10 @@
 <p>Or directly via <code>TenantContext</code> (not recommended in route handlers — prefer <code>Depends</code>):</p>
 <div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">fastapi_tenancy.core.context</span><span class="w"> </span><span class="kn">import</span> <span class="n">TenantContext</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">TenantContext</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>  <span class="c1"># raises if not set</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">tenant</span> <span class="o">=</span> <span class="n">TenantContext</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>  <span class="c1"># raises TenantNotFoundError if not set</span>
 </span></code></pre></div>
 <h2 id="websocket-support">WebSocket support<a class="headerlink" href="#websocket-support" title="Anchor link to this section">&para;</a></h2>
-<p>The middleware handles both <code>http</code> and <code>websocket</code> scope types. WebSocket connections are resolved the same way as HTTP requests:</p>
+<p>The middleware resolves the <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> from the WebSocket upgrade request using the same resolver that handles HTTP. Resolution is based on the request headers (or path / JWT, depending on <code>resolution_strategy</code>).</p>
 <div class="language-python highlight"><span class="filename">Python</span><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nd">@app</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">&quot;/ws/events&quot;</span><span class="p">)</span>
 </span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">websocket_events</span><span class="p">(</span>
 </span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">,</span>
@@ -2063,8 +2133,13 @@
 </span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="p">):</span>
 </span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
 </span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="c1"># tenant is resolved from the upgrade request headers</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="o">...</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>        <span class="n">data</span> <span class="o">=</span> <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">receive_json</span><span class="p">()</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">send_json</span><span class="p">({</span><span class="s2">&quot;tenant&quot;</span><span class="p">:</span> <span class="n">tenant</span><span class="o">.</span><span class="n">identifier</span><span class="p">,</span> <span class="s2">&quot;echo&quot;</span><span class="p">:</span> <span class="n">data</span><span class="p">})</span>
 </span></code></pre></div>
+<p>If the <abbr title="A single customer or user group whose data is isolated from all other tenants.">tenant</abbr> is not found, inactive, or the rate limit is exceeded during a WebSocket handshake, the middleware closes the connection with an appropriate close code rather than sending an HTTP response.</p>
+<h2 id="_json_response-internal-helper"><code>_json_response</code> internal helper<a class="headerlink" href="#_json_response-internal-helper" title="Anchor link to this section">&para;</a></h2>
+<p>The <code>_json_response</code> function used internally to build HTTP error responses is a proper <code>async def</code> coroutine. This makes it safe to call with <code>await</code> and ensures any forgotten <code>await</code> is caught as a type error rather than silently producing a no-op coroutine object.</p>
 <!-- Glossary abbreviations — auto-appended to every page via pymdownx.snippets -->
 <!-- The full glossary page is rendered at reference/glossary-page.md          -->
 
